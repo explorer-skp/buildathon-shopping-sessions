@@ -12,6 +12,7 @@ use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 mod bump;
 mod pq;
 mod scan;
+mod ts;
 
 #[global_allocator]
 static GA: bump::Bump = bump::Bump;
@@ -659,9 +660,9 @@ fn parse_events(
                     return;
                 }
                 let h = xxh3_128(eid);
-                let ingest = parse_ts(ing).unwrap_or(i64::MAX);
+                let ingest = crate::ts::parse_ts(ing).unwrap_or(i64::MAX);
                 let mut ok = !uid.is_empty() && !pid.is_empty();
-                let tsv = match parse_ts(ts) {
+                let tsv = match crate::ts::parse_ts(ts) {
                     Some(t) if t >= ws && t < we => (t - ws) as u32,
                     _ => {
                         ok = false;
@@ -718,7 +719,7 @@ fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, ca
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
-                let Some(t) = parse_ts(ts) else { return };
+                let Some(t) = crate::ts::parse_ts(ts) else { return };
                 if t < cbase || t >= we {
                     return;
                 }
