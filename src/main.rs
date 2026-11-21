@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
+mod bump;
 mod pq;
 mod scan;
+
+#[global_allocator]
+static GA: bump::Bump = bump::Bump;
 
 /// Keys are already xxh3 hashes: pass them straight through.
 #[derive(Default, Clone, Copy)]
@@ -727,6 +731,7 @@ fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, ca
 }
 
 fn main() {
+    bump::init();
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));

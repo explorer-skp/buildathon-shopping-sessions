@@ -32,7 +32,7 @@ jobs:
             e=$(date +%s.%N)
             echo "$2: $(echo "$e - $s" | bc) s"
           }
-          for i in 1 2 3; do run "-e GLIBC_TUNABLES=" "plain"; run "" "thp-malloc"; done
+          for i in 1 2 3; do run "-e SS_NOBUMP=1" "A"; run "" "B"; done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
       - name: Compare with a known-good build on x86
