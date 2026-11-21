@@ -5,6 +5,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Machine
         run: |
           nproc; free -g | head -2; lscpu | grep -E "Model name|Flags" | cut -c1-200
@@ -33,3 +35,12 @@ jobs:
           for i in 1 2 3; do run "-e GLIBC_TUNABLES=" "plain"; run "" "thp-malloc"; done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
+      - name: Compare with a known-good build on x86
+        run: |
+          git worktree add -q ../ref 57fb1f3094ccb8235fe30e3abb35b37ce8e32e43
+          (cd ../ref && RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q)
+          sudo rm -rf out-ref out-new && mkdir out-ref out-new && chmod 777 out-new
+          env NCPU=$(nproc) SS_QUIET=1 DATA_DIR=data OUTPUT_DIR=out-ref ../ref/target/release/sessions
+          docker run --rm --user 1000:1000 -e NCPU=$(nproc) -v $PWD/data:/data:ro -v $PWD/out-new:/output entry
+          pip install -q polars
+          python3 tools/pqdiff.py out-ref out-new
