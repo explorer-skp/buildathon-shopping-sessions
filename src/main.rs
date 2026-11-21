@@ -911,6 +911,13 @@ fn parse_clicks(
 }
 
 fn main() {
+    // measurement build: run the whole pipeline once in a child first
+    if std::env::var_os("SS_TWICE").is_some() {
+        let st = std::process::Command::new(std::env::current_exe().expect("exe")).env_remove("SS_TWICE").status().expect("child");
+        if !st.success() {
+            std::process::exit(st.code().unwrap_or(1));
+        }
+    }
     bump::init();
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
