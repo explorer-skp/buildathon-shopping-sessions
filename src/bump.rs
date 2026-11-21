@@ -4,9 +4,9 @@
 //! arrays once and exits without freeing them, so frees there are no-ops.
 //! Huge pages cut the page faults of a 20M-event run several hundred fold.
 //!
-//! Region 1 is scratch: a thread allocates there only while it has selected
-//! it, and `reset(1)` hands its memory out again once everything in it is
-//! dead. Reused pages skip the kernel zeroing fresh pages get.
+//! Regions 1 and 2 are scratch: a thread allocates there only while it has
+//! selected one, and `reset` hands a region's memory out again once everything
+//! in it is dead. Reused pages skip the kernel zeroing fresh pages get.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -27,7 +27,7 @@ impl Region {
     }
 }
 
-static REGS: [Region; 2] = [Region::new(), Region::new()];
+static REGS: [Region; 3] = [Region::new(), Region::new(), Region::new()];
 static ON: AtomicBool = AtomicBool::new(true);
 const MIN: usize = 1024;
 const BLOCK: usize = 4 << 20;
@@ -35,7 +35,7 @@ const HUGE: usize = 2 << 20;
 
 thread_local! {
     // per region: (cursor, end, generation) of this thread's current block
-    static TL: [Cell<(usize, usize, usize)>; 2] = const { [Cell::new((0, 0, 0)), Cell::new((0, 0, 0))] };
+    static TL: [Cell<(usize, usize, usize)>; 3] = const { [Cell::new((0, 0, 0)), Cell::new((0, 0, 0)), Cell::new((0, 0, 0))] };
     static SEL: Cell<usize> = const { Cell::new(0) };
     static LOCAL_OFF: Cell<bool> = const { Cell::new(false) };
 }
@@ -49,7 +49,7 @@ pub fn local_on() {
     LOCAL_OFF.with(|c| c.set(false));
 }
 
-/// This thread's later allocations come from region `r` (0 or 1).
+/// This thread's later allocations come from region `r` (0, 1 or 2).
 pub fn select(r: usize) {
     SEL.with(|c| c.set(if REGS[r].base.load(Ordering::Relaxed) != 0 { r } else { 0 }));
 }
@@ -97,6 +97,7 @@ pub fn init() {
     map(&REGS[0], &[64, 32, 16, 8]);
     if REGS[0].base.load(Ordering::Relaxed) != 0 && std::env::var_os("SS_NOREUSE").is_none() {
         map(&REGS[1], &[32, 16, 8]);
+        map(&REGS[2], &[32, 16, 8]);
     }
 }
 

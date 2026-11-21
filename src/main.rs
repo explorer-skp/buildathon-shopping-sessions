@@ -791,7 +791,10 @@ fn parse_events(
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
+            // records die after routing: scratch region 2
+            bump::select(2);
             let mut recs: Vec<Vec<Rec>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 70 / nlb + 16)).collect();
+            bump::select(0);
             let mut purch: Vec<(u32, u16)> = Vec::new();
             // dedup keys die after dedup, so they live in the scratch region
             bump::select(1);
@@ -884,8 +887,8 @@ fn parse_clicks(
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            // raw clicks die once routed, so they live in the scratch region
-            bump::select(1);
+            // raw clicks die once routed: scratch region 2
+            bump::select(2);
             let mut v: Vec<Vec<ClP>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 45 / nlb + 16)).collect();
             bump::select(0);
             let mut cswc: swc::Swc<ClP> = swc::Swc::new(nlb);
@@ -1127,6 +1130,8 @@ fn main() {
         });
     }
     std::mem::forget(ev_keys);
+    // dedup keys are dead: their memory takes the routed clicks and events
+    bump::reset(1);
     log!("deduped {:?}", t0.elapsed());
 
     let link = link_thread.join().expect("link thread");
@@ -1139,7 +1144,9 @@ fn main() {
         .map(|b| {
             let n: usize = cl_raw.iter().map(|v| v[b].len()).sum();
             let per = n / NP;
+            bump::select(1);
             let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 8)).collect();
+            bump::select(0);
             let mut swc: swc::Swc<ClP> = swc::Swc::new(NP);
             for v in cl_raw.iter() {
                 for &c in v[b].iter() {
@@ -1155,8 +1162,6 @@ fn main() {
         })
         .collect();
     std::mem::forget(cl_raw);
-    // dedup keys and raw clicks are dead: their memory takes the routed events
-    bump::reset(1);
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- kept events: resolve persons one table slice at a time, route to person partitions
@@ -1205,6 +1210,8 @@ fn main() {
     }
     let purchases = &purchases;
     std::mem::forget(ev_recs);
+    // records and raw clicks are dead: their memory takes the sessionize buffers
+    bump::reset(2);
     log!("routed events {:?}", t0.elapsed());
 
     // ---------------- sessionize, attribute, aggregate (parallel by person partitions)
@@ -1242,6 +1249,7 @@ fn main() {
     let mut parts: Vec<Part> = task_order
         .into_par_iter()
         .map(|t| {
+            bump::select(2);
             // campaign totals per worker thread: tasks on one thread never overlap
             let mut acc_guard = camp_accs[rayon::current_thread_index().unwrap_or(0) % camp_accs.len()].lock().unwrap();
             if acc_guard.is_empty() {
@@ -1472,6 +1480,7 @@ fn main() {
                     ci = cj;
                 }
             }
+            bump::select(0);
             if !rows.is_empty() {
                 // write this task's file now, so encoding overlaps other tasks; the
                 // writer frees and reallocates buffers, so it uses the system allocator
