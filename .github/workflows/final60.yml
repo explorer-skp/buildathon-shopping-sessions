@@ -1,0 +1,41 @@
+name: final60
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        description: first commit
+        required: true
+      b:
+        description: second commit
+        required: true
+jobs:
+  ab60:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build both images
+        run: |
+          git worktree add -q ../a ${{ inputs.a }} && docker build -q --platform linux/amd64 -t a ../a
+          git worktree add -q ../b ${{ inputs.b }} && docker build -q --platform linux/amd64 -t b ../b
+      - name: Make a 60M-event dataset
+        run: |
+          curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q generator.zip
+          G=$(dirname $(find . -name Cargo.toml -path '*generator*' | head -1))
+          (cd $G && cargo build --release -q)
+          $G/target/release/generate --seed 61 --events 60000000 --clicks 15000000 --output data
+          free -g | head -2
+      - name: Time runs
+        run: |
+          mkdir -p scratch && chmod 777 scratch
+          run() {
+            sudo rm -rf out && mkdir out && chmod 777 out
+            s=$(date +%s.%N)
+            docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
+              -e NCPU=$(nproc) -e MEM_GB=12 -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch $1
+            e=$(date +%s.%N)
+            echo "$1: $(echo "$e - $s" | bc) s"
+          }
+          for i in 1 2 3; do run a; run b; done
