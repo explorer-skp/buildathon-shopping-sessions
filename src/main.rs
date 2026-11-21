@@ -561,7 +561,7 @@ struct ClP {
 /// key writes, 3 = no timestamp parsing, 4 = no hashing.
 static PMODE: std::sync::LazyLock<u8> =
     std::sync::LazyLock::new(|| std::env::var("SS_PMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-const PB: u32 = 10; // person partitions = 1 << PB (by person key)
+const PB: u32 = 11; // person partitions = 1 << PB (by person key); about 9k rows each at 20M, so a partition stays in L2
 const NP: usize = 1 << PB;
 
 #[inline]
