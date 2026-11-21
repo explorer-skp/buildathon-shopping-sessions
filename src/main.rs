@@ -952,65 +952,6 @@ fn main() {
     let cl_maps = map_files(&cl_paths);
     let ln_maps = map_files(&ln_paths);
 
-    // products and campaigns (small, clean); the raw buffers live to the end
-    let prod_raw: &'static [u8] = Box::leak(std::fs::read(data.join("products.csv")).unwrap_or_default().into_boxed_slice());
-    let camp_raw: &'static [u8] = Box::leak(std::fs::read(data.join("campaigns.csv")).unwrap_or_default().into_boxed_slice());
-    let mut cat_names: Vec<Vec<u8>> = vec![];
-    let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
-    let mut prod: StrMap<u16> = StrMap::new();
-    {
-        let body = match memchr::memchr(b'\n', prod_raw) {
-            Some(h) => &prod_raw[h + 1..],
-            None => &prod_raw[0..0],
-        };
-        for_lines(body, |l| {
-            if let Some([p, c]) = fields_fast::<2>(l) {
-                let n = cat_idx.len() as u16;
-                let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
-                    cat_names.push(c.to_vec());
-                    n
-                });
-                prod.insert_first(p, ci);
-            }
-        });
-    }
-    let unknown_cat = match cat_idx.get(&b"unknown"[..]) {
-        Some(&c) => c,
-        None => {
-            cat_names.push(b"unknown".to_vec());
-            (cat_names.len() - 1) as u16
-        }
-    };
-    let ncat = cat_names.len();
-    let mut order: Vec<usize> = (0..ncat).collect();
-    order.sort_by(|a, b| cat_names[*a].cmp(&cat_names[*b]));
-    let mut cat_rank = vec![0usize; ncat];
-    for (r, &c) in order.iter().enumerate() {
-        cat_rank[c] = r;
-    }
-
-    let mut camp_names: Vec<Vec<u8>> = vec![];
-    let mut camp_chan: Vec<Vec<u8>> = vec![];
-    let mut camp: StrMap<u32> = StrMap::new();
-    {
-        let body = match memchr::memchr(b'\n', camp_raw) {
-            Some(h) => &camp_raw[h + 1..],
-            None => &camp_raw[0..0],
-        };
-        for_lines(body, |l| {
-            if let Some([c, ch]) = fields_fast::<2>(l) {
-                if camp.insert_first(c, camp_names.len() as u32) {
-                    camp_names.push(c.to_vec());
-                    camp_chan.push(ch.to_vec());
-                }
-            }
-        });
-    }
-    let organic = camp_names.len() as u32;
-    camp_names.push(b"organic".to_vec());
-    camp_chan.push(b"organic".to_vec());
-    let ncamp = camp_names.len();
-    log!("tables {:?}", t0.elapsed());
 
     // dedup buckets of about 40k copies keep each bucket's table in L2; chunks
     // grow with the bucket count so each chunk still fills its buckets
@@ -1022,10 +963,77 @@ fn main() {
         .unwrap_or_else(|| (ev_bytes / 76 / 40_000).next_power_of_two().clamp(256, 4096));
     let ev_chunks = chunks(&ev_maps, (4usize << 20) * nb / 512);
     let cl_chunks = chunks(&cl_maps, 4 << 20);
-    let ln_chunks = chunks(&ln_maps, 1 << 20);
+
 
     // ---------------- links on one worker, overlapped with parsing events and clicks
-    let (ln_pairs, ln_ends, n_ids) = link_ids(&ln_maps, &ln_chunks);
+    // the small product and campaign tables load while the pool parses link lines
+    let ln_chunks = chunks(&ln_maps, 1 << 20);
+    let (tables, (ln_pairs, ln_ends, n_ids)) = rayon::join(
+        || {
+        // products and campaigns (small, clean); the raw buffers live to the end
+        let prod_raw: &'static [u8] = Box::leak(std::fs::read(data.join("products.csv")).unwrap_or_default().into_boxed_slice());
+        let camp_raw: &'static [u8] = Box::leak(std::fs::read(data.join("campaigns.csv")).unwrap_or_default().into_boxed_slice());
+        let mut cat_names: Vec<Vec<u8>> = vec![];
+        let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
+        let mut prod: StrMap<u16> = StrMap::new();
+        {
+            let body = match memchr::memchr(b'\n', prod_raw) {
+                Some(h) => &prod_raw[h + 1..],
+                None => &prod_raw[0..0],
+            };
+            for_lines(body, |l| {
+                if let Some([p, c]) = fields_fast::<2>(l) {
+                    let n = cat_idx.len() as u16;
+                    let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
+                        cat_names.push(c.to_vec());
+                        n
+                    });
+                    prod.insert_first(p, ci);
+                }
+            });
+        }
+        let unknown_cat = match cat_idx.get(&b"unknown"[..]) {
+            Some(&c) => c,
+            None => {
+                cat_names.push(b"unknown".to_vec());
+                (cat_names.len() - 1) as u16
+            }
+        };
+        let ncat = cat_names.len();
+        let mut order: Vec<usize> = (0..ncat).collect();
+        order.sort_by(|a, b| cat_names[*a].cmp(&cat_names[*b]));
+        let mut cat_rank = vec![0usize; ncat];
+        for (r, &c) in order.iter().enumerate() {
+            cat_rank[c] = r;
+        }
+
+        let mut camp_names: Vec<Vec<u8>> = vec![];
+        let mut camp_chan: Vec<Vec<u8>> = vec![];
+        let mut camp: StrMap<u32> = StrMap::new();
+        {
+            let body = match memchr::memchr(b'\n', camp_raw) {
+                Some(h) => &camp_raw[h + 1..],
+                None => &camp_raw[0..0],
+            };
+            for_lines(body, |l| {
+                if let Some([c, ch]) = fields_fast::<2>(l) {
+                    if camp.insert_first(c, camp_names.len() as u32) {
+                        camp_names.push(c.to_vec());
+                        camp_chan.push(ch.to_vec());
+                    }
+                }
+            });
+        }
+        let organic = camp_names.len() as u32;
+        camp_names.push(b"organic".to_vec());
+        camp_chan.push(b"organic".to_vec());
+        let ncamp = camp_names.len();
+            (cat_names, prod, unknown_cat, ncat, cat_rank, camp_names, camp_chan, camp, organic, ncamp)
+        },
+        || link_ids(&ln_maps, &ln_chunks),
+    );
+    let (cat_names, prod, unknown_cat, ncat, cat_rank, camp_names, camp_chan, camp, organic, ncamp) = tables;
+    log!("tables and link ids {:?}", t0.elapsed());
     // slices of 32k slots (512 KB), at most 256 of them
     let lcap = LinkTable::cap_for(n_ids);
     let lbits = (lcap.trailing_zeros() as i32 - 15).clamp(0, 8) as u32;
