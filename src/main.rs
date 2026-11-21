@@ -8,9 +8,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
+use h::{h128 as xxh3_128, h64 as xxh3_64};
 
 mod bump;
+mod h;
 mod pq;
 mod scan;
 mod ts;
