@@ -1143,7 +1143,6 @@ fn main() {
 
     struct Part {
         user_rows: Vec<(u64, i32, u32, u32, u64, i32)>, // name, day, sessions, events, revenue, top cat (-1)
-        camp: Vec<[u64; 4]>,                           // ncamp*ndays: sessions, purchasing, revenue, assisted
     }
     let dd_ref = &dd;
     let cl_ref = &cl_parts;
@@ -1152,10 +1151,18 @@ fn main() {
     let n_kept: usize = dd.iter().map(|g| g.iter().map(|v| v.len()).sum::<usize>()).sum();
     let sb = ((n_kept / NP / 8).max(1).ilog2()).clamp(4, 16);
     let cat_rank = &cat_rank;
+    let camp_accs: Vec<std::sync::Mutex<Vec<[u64; 4]>>> =
+        (0..rayon::current_num_threads().max(1)).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+    let camp_accs = &camp_accs;
     let mut parts: Vec<Part> = (0..tasks)
         .into_par_iter()
         .map(|t| {
-            let mut camp_acc = vec![[0u64; 4]; ncamp * ndays];
+            // campaign totals per worker thread: tasks on one thread never overlap
+            let mut acc_guard = camp_accs[rayon::current_thread_index().unwrap_or(0) % camp_accs.len()].lock().unwrap();
+            if acc_guard.is_empty() {
+                *acc_guard = vec![[0u64; 4]; ncamp * ndays];
+            }
+            let camp_acc: &mut Vec<[u64; 4]> = &mut acc_guard;
             let n_task: usize = (t * per_t..((t + 1) * per_t).min(NP)).map(|p| dd_ref.iter().map(|g| g[p].len()).sum::<usize>()).sum();
             let mut rows = Vec::with_capacity(n_task / 6 + 64);
             let mut catrev = vec![0u64; ncat];
@@ -1375,18 +1382,19 @@ fn main() {
                     ci = cj;
                 }
             }
-            Part { user_rows: rows, camp: camp_acc }
+            Part { user_rows: rows }
         })
         .collect();
     log!("sessionized {:?}", t0.elapsed());
     if parts.is_empty() {
-        parts.push(Part { user_rows: vec![], camp: vec![[0u64; 4]; ncamp * ndays] });
+        parts.push(Part { user_rows: vec![] });
     }
 
     // ---------------- merge campaign accumulators
     let mut camp_tot = vec![[0u64; 4]; ncamp * ndays];
-    for p in &parts {
-        for (i, a) in p.camp.iter().enumerate() {
+    for acc in camp_accs.iter() {
+        let acc = acc.lock().unwrap();
+        for (i, a) in acc.iter().enumerate() {
             if a[0] | a[3] != 0 {
                 for k in 0..4 {
                     camp_tot[i][k] += a[k];
