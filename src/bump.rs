@@ -101,11 +101,13 @@ pub fn init() {
     }
 }
 
-/// The used part of each region, split into pieces of at most `piece` bytes,
-/// for releasing the memory from several threads before exit.
+/// The used part of the scratch regions (1 and 2), split into pieces of at
+/// most `piece` bytes, for releasing that memory from several threads before
+/// exit. Region 0 also holds live runtime state (the thread pool's queues),
+/// so it is never released.
 pub fn used_pieces(piece: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
-    for g in REGS.iter() {
+    for g in REGS[1..].iter() {
         let b = g.base.load(Ordering::Relaxed);
         if b == 0 {
             continue;
