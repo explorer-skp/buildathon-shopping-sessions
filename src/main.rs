@@ -572,6 +572,7 @@ fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     sb: u32,
     key: impl Fn(&T) -> u64,
     less: impl Fn(&T, &T) -> bool,
+    by_rest: impl Fn(&mut [T]),
     cnt: &mut [u32],
     out: &mut Vec<T>,
 ) -> usize {
@@ -618,6 +619,9 @@ fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
                     }
                     g[j] = x;
                 }
+            } else if key(&g[0]) == key(&g[g.len() - 1]) && g.iter().all(|x| key(x) == key(&g[0])) {
+                // one person, often a heavy one: sort on the rest of the key
+                by_rest(g);
             } else {
                 g.sort_unstable_by(|a, b| {
                     if less(a, b) {
@@ -904,11 +908,13 @@ fn main() {
     // ---------------- links on one worker, overlapped with parsing events and clicks
     let (ln_parsed, ids) = link_ids(&ln_maps, &ln_chunks);
     log!("link ids {:?}", t0.elapsed());
+    // the union-find runs on its own thread while the pool parses events and clicks together
     let link_thread = std::thread::spawn(move || link_table(ln_parsed, ids));
-    let parsed = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb);
-    log!("parsed events {:?}", t0.elapsed());
-    let cl_raw = parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp);
-    log!("parsed clicks {:?}", t0.elapsed());
+    let (parsed, cl_raw) = rayon::join(
+        || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb),
+        || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp),
+    );
+    log!("parsed events and clicks {:?}", t0.elapsed());
     let link = link_thread.join().expect("link thread");
     let link = &link;
     log!("linked {} ids, all parsed {:?}", link.n, t0.elapsed());
@@ -1092,6 +1098,7 @@ fn main() {
                         sb,
                         |e: &EvP| e.pk,
                         |a: &EvP, b: &EvP| (a.pk, a.ts) < (b.pk, b.ts),
+                        |g: &mut [EvP]| g.sort_unstable_by_key(|e| e.ts),
                         &mut cnt,
                         &mut evs,
                     );
@@ -1106,6 +1113,7 @@ fn main() {
                             (a.pk, a.ts).cmp(&(b.pk, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
                                 == std::cmp::Ordering::Less
                         },
+                        |g: &mut [ClP]| g.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))),
                         &mut cnt,
                         &mut cls,
                     );

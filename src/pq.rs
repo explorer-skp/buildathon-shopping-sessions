@@ -25,8 +25,16 @@ fn props() -> Arc<WriterProperties> {
     )
 }
 
+/// A string the writer reads without copying it first. Every string handed to
+/// the writers lives until the process exits (mapped inputs and leaked tables).
+#[inline]
+fn ba(b: &[u8]) -> ByteArray {
+    let s: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(b) };
+    ByteArray::from(bytes::Bytes::from_static(s))
+}
+
 fn bytes_col<'a>(n: usize, f: impl Fn(usize) -> &'a [u8]) -> Vec<ByteArray> {
-    (0..n).map(|i| ByteArray::from(f(i).to_vec())).collect()
+    (0..n).map(|i| ba(f(i))).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,7 +85,7 @@ pub fn write_user_daily<'a>(
         for i in 0..n {
             match top(i) {
                 Some(b) => {
-                    vals.push(ByteArray::from(b.to_vec()));
+                    vals.push(ba(b));
                     defs.push(1i16);
                 }
                 None => defs.push(0),
