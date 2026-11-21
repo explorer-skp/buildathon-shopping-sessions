@@ -1,1 +1,1 @@
-gdiv2 -e SS_GDIV=2
+tmul32 -e SS_TMUL=32

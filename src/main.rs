@@ -1157,7 +1157,8 @@ fn main() {
     // ---------------- sessionize, attribute, aggregate (parallel by person partitions)
     let ndays = ((we - ws + DAY - 1) / DAY + 1) as usize;
     let day0 = ws.div_euclid(DAY);
-    let tasks = (ncpu * 8).clamp(1, NP);
+    let tmul: usize = std::env::var("SS_TMUL").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let tasks = (ncpu * tmul).clamp(1, NP);
     let per_t = NP.div_ceil(tasks);
 
     struct Part {
