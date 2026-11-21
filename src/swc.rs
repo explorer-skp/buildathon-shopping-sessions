@@ -15,6 +15,12 @@ impl<T: Copy> Swc<T> {
         Swc { stage, cnt: vec![0; n] }
     }
 
+    /// Rows staged for vector b and not yet written.
+    #[inline(always)]
+    pub fn pending(&self, b: usize) -> usize {
+        self.cnt[b] as usize
+    }
+
     #[inline(always)]
     pub fn push(&mut self, dst: &mut [Vec<T>], b: usize, x: T) {
         let c = self.cnt[b] as usize;

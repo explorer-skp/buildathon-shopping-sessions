@@ -797,6 +797,8 @@ fn parse_events(
             bump::select(1);
             let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
             bump::select(0);
+            let mut rswc: swc::Swc<Rec> = swc::Swc::new(nlb);
+            let mut kswc: swc::Swc<Key> = swc::Swc::new(nb);
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
@@ -851,14 +853,16 @@ fn parse_events(
                         0
                     };
                     let b = lb.of(uh);
-                    let pos = recs[b].len() as u32;
-                    recs[b].push(Rec { uh, uref: pack(uid), ts: tsv, pur });
+                    let pos = (recs[b].len() + rswc.pending(b)) as u32;
+                    rswc.push(&mut recs, b, Rec { uh, uref: pack(uid), ts: tsv, pur });
                     ((b as u32) << 24) | pos
                 } else {
                     u32::MAX
                 };
-                buckets[(h >> 64) as usize & (nb - 1)].push(Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
+                kswc.push(&mut buckets, (h >> 64) as usize & (nb - 1), Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
             });
+            rswc.finish(&mut recs);
+            kswc.finish(&mut buckets);
             (recs, buckets, purch)
         })
         .collect()
@@ -884,6 +888,7 @@ fn parse_clicks(
             bump::select(1);
             let mut v: Vec<Vec<ClP>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 45 / nlb + 16)).collect();
             bump::select(0);
+            let mut cswc: swc::Swc<ClP> = swc::Swc::new(nlb);
             scan::for_records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
@@ -894,8 +899,9 @@ fn parse_clicks(
                 }
                 let Some(ci) = camp.get(cmp) else { return };
                 let uh = xxh3_64(uid);
-                v[lb.of(uh)].push(ClP { pk: uh, cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
+                cswc.push(&mut v, lb.of(uh), ClP { pk: uh, cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
             });
+            cswc.finish(&mut v);
             v
         })
         .collect()
@@ -1133,16 +1139,18 @@ fn main() {
         .map(|b| {
             let n: usize = cl_raw.iter().map(|v| v[b].len()).sum();
             let per = n / NP;
-            let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 4)).collect();
+            let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 8)).collect();
+            let mut swc: swc::Swc<ClP> = swc::Swc::new(NP);
             for v in cl_raw.iter() {
                 for &c in v[b].iter() {
                     let mut c = c;
                     if let Some(x) = link.get_direct(c.pk) {
                         c.pk = x;
                     }
-                    parts[part_of(c.pk)].push(c);
+                    swc.push(&mut parts, part_of(c.pk), c);
                 }
             }
+            swc.finish(&mut parts);
             parts
         })
         .collect();
