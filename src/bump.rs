@@ -122,7 +122,8 @@ fn ours(p: *mut u8) -> bool {
 
 #[inline(always)]
 fn bump(r: usize, size: usize, align: usize) -> *mut u8 {
-    let align = align.max(16);
+    // large blocks start on a cache line, so streamed stores can be aligned
+    let align = if size >= 4096 { align.max(64) } else { align.max(16) };
     let g = &REGS[r];
     TL.with(|tl| {
         let c = &tl[r];

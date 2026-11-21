@@ -14,6 +14,7 @@ mod bump;
 mod h;
 mod pq;
 mod scan;
+mod swc;
 mod ts;
 
 #[global_allocator]
@@ -1160,8 +1161,9 @@ fn main() {
             let mut purch: Vec<(u32, u16)> = Vec::new();
             let n_est: usize = ev_recs.iter().map(|r| r[b].len()).sum();
             bump::select(1);
-            let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
+            let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 8)).collect();
             bump::select(0);
+            let mut swc: swc::Swc<EvP> = swc::Swc::new(NP);
             for c in 0..ev_recs.len() {
                 let recs = &ev_recs[c][b];
                 let lw = &losers[c][b];
@@ -1180,9 +1182,10 @@ fn main() {
                     } else {
                         0
                     };
-                    parts[part_of(pk)].push(EvP { pk, nref, ts: r.ts, aux });
+                    swc.push(&mut parts, part_of(pk), EvP { pk, nref, ts: r.ts, aux });
                 }
             }
+            swc.finish(&mut parts);
             (b, parts, purch)
         })
         .collect();
