@@ -534,15 +534,15 @@ impl LinkTable {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed (non-malformed) event copy, kept in file order.
+/// One parsed (non-malformed) event copy, kept in file order. `uref` is 0
+/// unless the copy is valid and not late, so the event counts only if this is
+/// the kept copy and `uref != 0`.
 #[derive(Clone, Copy)]
 struct Rec {
-    uh: u64,   // user_id hash (meaningful when keep)
-    uref: u64, // user_id bytes (meaningful when keep)
+    uh: u64,   // user_id hash
+    uref: u64, // user_id bytes
     ts: u32,   // ms since window start
-    price: u32,
-    cat: u16,
-    keep: bool, // valid and not late: the event counts if this copy is the one kept
+    pur: u32,  // 0, or index + 1 into the chunk's purchases (price, category)
 }
 
 /// The dedup key of one copy: 96 bits of the event_id hash, the copy's
@@ -772,13 +772,14 @@ fn parse_events(
     prod: &StrMap<u16>,
     unknown_cat: u16,
     nb: usize,
-) -> Vec<(Vec<Rec>, Vec<Vec<Key>>)> {
+) -> Vec<(Vec<Rec>, Vec<Vec<Key>>, Vec<(u32, u16)>)> {
     chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut recs: Vec<Rec> = Vec::with_capacity(buf.len() / 70 + 16);
+            let mut purch: Vec<(u32, u16)> = Vec::new();
             let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
@@ -826,10 +827,16 @@ fn parse_events(
                 let keep = ok && ingest - (tsv as i64 + ws) <= DAY;
                 let (uh, uref) = if keep { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
                 let rix = recs.len() as u32;
-                recs.push(Rec { uh, uref, ts: tsv, price: pr, cat, keep });
+                let pur = if keep && pr > 0 {
+                    purch.push((pr, cat));
+                    purch.len() as u32
+                } else {
+                    0
+                };
+                recs.push(Rec { uh, uref, ts: tsv, pur });
                 buckets[(h >> 64) as usize & (nb - 1)].push(Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
             });
-            (recs, buckets)
+            (recs, buckets, purch)
         })
         .collect()
 }
@@ -971,7 +978,14 @@ fn main() {
         || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp),
     );
     log!("parsed events and clicks {:?}", t0.elapsed());
-    let (ev_recs, ev_keys): (Vec<Vec<Rec>>, Vec<Vec<Vec<Key>>>) = parsed.into_iter().unzip();
+    let mut ev_recs: Vec<Vec<Rec>> = Vec::with_capacity(parsed.len());
+    let mut ev_keys: Vec<Vec<Vec<Key>>> = Vec::with_capacity(parsed.len());
+    let mut ev_purch: Vec<Vec<(u32, u16)>> = Vec::with_capacity(parsed.len());
+    for (r, k, pu) in parsed {
+        ev_recs.push(r);
+        ev_keys.push(k);
+        ev_purch.push(pu);
+    }
 
     // ---------------- dedup on event_id: mark each copy that is not the kept one.
     // It needs no person data, so it runs while the union-find may still be going.
@@ -1100,12 +1114,12 @@ fn main() {
                         link.prefetch(recs[i + 16].uh);
                     }
                     let r = &recs[i];
-                    if !r.keep || (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
+                    if r.uref == 0 || (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
                         continue;
                     }
                     let pk = link.get(r.uh).unwrap_or(r.uh);
-                    let aux = if r.price > 0 {
-                        purch.push((r.price, r.cat));
+                    let aux = if r.pur != 0 {
+                        purch.push(ev_purch[c][(r.pur - 1) as usize]);
                         ((g as u32) << 24) | purch.len() as u32
                     } else {
                         0
