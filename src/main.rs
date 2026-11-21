@@ -368,6 +368,10 @@ fn map_files(paths: &[PathBuf]) -> Vec<Option<Mmap>> {
             #[cfg(unix)]
             {
                 let _ = m.advise(memmap2::Advice::Sequential);
+                // optional: start reading the whole file now, in case it is not cached
+                if std::env::var_os("SS_WILLNEED").is_some() {
+                    let _ = m.advise(memmap2::Advice::WillNeed);
+                }
             }
             Some(m)
         })
