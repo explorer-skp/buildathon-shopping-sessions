@@ -105,4 +105,49 @@ mod tests {
         }
         assert!(n > 1_000_000);
     }
+
+    #[test]
+    fn no_collisions_on_generator_shaped_ids() {
+        fn base36(mut v: u64, out: &mut Vec<u8>) {
+            let mut buf = [0u8; 13];
+            let mut at = 13;
+            loop {
+                at -= 1;
+                buf[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(v % 36) as usize];
+                v /= 36;
+                if v == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(&buf[at..]);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(6_000_000);
+        let mut seen128 = std::collections::HashSet::with_capacity(6_000_000);
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut ids: Vec<Vec<u8>> = Vec::new();
+        for prefix in [b'u', b'e', b'k'] {
+            for _ in 0..1_700_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mut id = vec![prefix];
+                base36(x & ((1 << 40) - 1), &mut id);
+                ids.push(id);
+            }
+        }
+        for i in 1..=100_000u64 {
+            ids.push(format!("p{i}").into_bytes());
+            ids.push(format!("P{i}").into_bytes());
+            ids.push(format!("c_{i}").into_bytes());
+        }
+        let upper: Vec<Vec<u8>> = ids.iter().take(200_000).map(|v| v.to_ascii_uppercase()).collect();
+        ids.extend(upper);
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
+            assert!(seen.insert(h64(id)), "64-bit collision at {:?}", String::from_utf8_lossy(id));
+            assert!(seen128.insert(h128(id)), "128-bit collision at {:?}", String::from_utf8_lossy(id));
+        }
+        assert!(ids.len() > 5_000_000);
+    }
 }
