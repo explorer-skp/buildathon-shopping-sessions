@@ -38,10 +38,64 @@ macro_rules! log {
 
 // ------------------------------------------------------------------ CSV
 
+/// Strips the quotes of one field given how many quote bytes it holds.
+#[inline(always)]
+fn unquote(f: &[u8], quotes: u32) -> Option<&[u8]> {
+    if quotes == 0 {
+        Some(f)
+    } else if quotes == 2 && f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+        Some(&f[1..f.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Same contract as `fields`, in one pass over the line's bytes: commas end
+/// fields, and a field may hold quotes only as one pair around all of it.
+#[inline(always)]
+fn fields_fast<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let mut out: [&[u8]; N] = [&[]; N];
+    let mut k = 0usize;
+    let mut start = 0usize;
+    let mut quotes = 0u32;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b',' {
+            if k + 1 >= N {
+                return None;
+            }
+            out[k] = unquote(&line[start..i], quotes)?;
+            k += 1;
+            start = i + 1;
+            quotes = 0;
+        } else if c == b'"' {
+            quotes += 1;
+        }
+    }
+    if k + 1 != N {
+        return None;
+    }
+    out[k] = unquote(&line[start..], quotes)?;
+    Some(out)
+}
+
+/// Hint the CPU to pull a cache line in ahead of use.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
 /// Splits one line into exactly N fields under the rules' dialect.
 /// Returns None for a malformed line. Quotes around a whole field are
 /// stripped; any other quote makes the line malformed.
 #[inline]
+#[allow(dead_code)]
 fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut out: [&[u8]; N] = [&[]; N];
     let mut start = 0usize;
@@ -303,6 +357,7 @@ fn unpack<'a>(r: u64) -> &'a [u8] {
 /// Open-addressing table from an ID hash to (person key, person name ref).
 /// Keys are xxh3 hashes, so the low bits index directly. Key 0 marks empty.
 struct LinkTable {
+    n: usize,
     mask: usize,
     slots: Vec<(u64, u64, u64)>,
 }
@@ -310,7 +365,7 @@ struct LinkTable {
 impl LinkTable {
     fn new(n: usize) -> Self {
         let cap = ((n * 8 / 5).max(16)).next_power_of_two();
-        LinkTable { mask: cap - 1, slots: vec![(0, 0, 0); cap] }
+        LinkTable { n: 0, mask: cap - 1, slots: vec![(0, 0, 0); cap] }
     }
     #[inline]
     fn fix(k: u64) -> u64 {
@@ -327,6 +382,11 @@ impl LinkTable {
             }
             i = (i + 1) & self.mask;
         }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        let i = (Self::fix(k) as usize) & self.mask;
+        prefetch(self.slots.as_ptr().wrapping_add(i));
     }
     #[inline]
     fn get(&self, k: u64) -> Option<(u64, u64)> {
@@ -348,12 +408,12 @@ impl LinkTable {
 // ------------------------------------------------------------------ records
 
 /// One parsed (non-malformed) event copy, before dedup.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Ev {
     eid: [u64; 2],
     ingest: i64,
-    pk: u64,   // person key (meaningful when ok)
-    nref: u64, // person name (meaningful when ok)
+    uh: u64,   // user_id hash (meaningful when ok)
+    uref: u64, // user_id bytes (meaningful when ok)
     ts: u32,   // ms since window start (meaningful when ok)
     price: u32,
     cat: u16,
@@ -416,110 +476,20 @@ impl<V: Copy> StrMap<V> {
     }
 }
 
-fn main() {
-    let t0 = Instant::now();
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
-    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
+// ------------------------------------------------------------------ phases
 
-    // manifest
-    let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
-    let grab = |k: &str| -> i64 {
-        let i = man.find(k).expect("key") + k.len();
-        let rest = &man[i..];
-        let q1 = rest.find('"').unwrap();
-        let rest = &rest[q1 + 1..];
-        let q2 = rest.find('"').unwrap();
-        parse_ts(rest[..q2].as_bytes()).expect("manifest ts")
-    };
-    let ws = grab("\"window_start\"");
-    let we = grab("\"window_end\"");
-    let cbase = ws - WEEK;
-
-    // map files first so the kernel can start reading while we build tables
-    let ev_paths = list_csv(&data.join("events"));
-    let cl_paths = list_csv(&data.join("clicks"));
-    let ln_paths = list_csv(&data.join("links"));
-    let ev_maps = map_files(&ev_paths);
-    let cl_maps = map_files(&cl_paths);
-    let ln_maps = map_files(&ln_paths);
-
-    // products and campaigns (small, clean); the raw buffers live to the end
-    let prod_raw: &'static [u8] = Box::leak(std::fs::read(data.join("products.csv")).unwrap_or_default().into_boxed_slice());
-    let camp_raw: &'static [u8] = Box::leak(std::fs::read(data.join("campaigns.csv")).unwrap_or_default().into_boxed_slice());
-    let mut cat_names: Vec<Vec<u8>> = vec![];
-    let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
-    let mut prod: StrMap<u16> = StrMap::new();
-    {
-        let body = match memchr::memchr(b'\n', prod_raw) {
-            Some(h) => &prod_raw[h + 1..],
-            None => &prod_raw[0..0],
-        };
-        for_lines(body, |l| {
-            if let Some([p, c]) = fields::<2>(l) {
-                let n = cat_idx.len() as u16;
-                let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
-                    cat_names.push(c.to_vec());
-                    n
-                });
-                prod.insert_first(p, ci);
-            }
-        });
-    }
-    let unknown_cat = match cat_idx.get(&b"unknown"[..]) {
-        Some(&c) => c,
-        None => {
-            cat_names.push(b"unknown".to_vec());
-            (cat_names.len() - 1) as u16
-        }
-    };
-    let ncat = cat_names.len();
-    let mut order: Vec<usize> = (0..ncat).collect();
-    order.sort_by(|a, b| cat_names[*a].cmp(&cat_names[*b]));
-    let mut cat_rank = vec![0usize; ncat];
-    for (r, &c) in order.iter().enumerate() {
-        cat_rank[c] = r;
-    }
-
-    let mut camp_names: Vec<Vec<u8>> = vec![];
-    let mut camp_chan: Vec<Vec<u8>> = vec![];
-    let mut camp: StrMap<u32> = StrMap::new();
-    {
-        let body = match memchr::memchr(b'\n', camp_raw) {
-            Some(h) => &camp_raw[h + 1..],
-            None => &camp_raw[0..0],
-        };
-        for_lines(body, |l| {
-            if let Some([c, ch]) = fields::<2>(l) {
-                if camp.insert_first(c, camp_names.len() as u32) {
-                    camp_names.push(c.to_vec());
-                    camp_chan.push(ch.to_vec());
-                }
-            }
-        });
-    }
-    let organic = camp_names.len() as u32;
-    camp_names.push(b"organic".to_vec());
-    camp_chan.push(b"organic".to_vec());
-    let ncamp = camp_names.len();
-    log!("tables {:?}", t0.elapsed());
-
-    let target = 4 << 20;
-    let ev_chunks = chunks(&ev_maps, target);
-    let cl_chunks = chunks(&cl_maps, target);
-    let ln_chunks = chunks(&ln_maps, 1 << 20);
-
-    // ---------------- links: union-find, person key = hash of the smallest ID
-    let ln_maps_ref = &ln_maps;
-    let ln_parsed: Vec<Vec<(u64, u64, u64, u64)>> = ln_chunks
+/// Joins every link line into people and returns the table from an ID hash
+/// to (person key, person name). The person key is the hash of the person's
+/// byte-wise smallest ID, and the name points at that ID's bytes.
+fn build_links(maps: &[Option<Mmap>], chunks: &[Chunk]) -> LinkTable {
+    let ln_parsed: Vec<Vec<(u64, u64, u64, u64)>> = chunks
         .par_iter()
         .map(|c| {
-            let b: &[u8] = ln_maps_ref[c.file].as_ref().unwrap();
+            let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::new();
             for_lines(buf, |l| {
-                let Some([a, bb]) = fields::<2>(l) else { return };
+                let Some([a, bb]) = fields_fast::<2>(l) else { return };
                 if a.is_empty() || bb.is_empty() {
                     return;
                 }
@@ -569,20 +539,28 @@ fn main() {
         let r = find(&mut parent, i) as usize;
         link.insert(ids[i as usize].0, ids[r].0, ids[r].1);
     }
-    let link = &link;
-    log!("linked {} ids {:?}", n_ids, t0.elapsed());
+    link.n = n_ids;
+    link
+}
 
-    // ---------------- events: parse into dedup buckets, resolving the person now
-    let ev_maps_ref = &ev_maps;
-    let prod_ref = &prod;
-    let parsed: Vec<Vec<Vec<Ev>>> = ev_chunks
+/// Parses every event file into dedup buckets keyed by the event_id hash.
+/// Persons are resolved later, after dedup, once the link table exists.
+fn parse_events(
+    maps: &[Option<Mmap>],
+    chunks: &[Chunk],
+    ws: i64,
+    we: i64,
+    prod: &StrMap<u16>,
+    unknown_cat: u16,
+) -> Vec<Vec<Vec<Ev>>> {
+    chunks
         .par_iter()
         .map(|c| {
-            let b: &[u8] = ev_maps_ref[c.file].as_ref().unwrap();
+            let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(buf.len() / 70 / NB + 8)).collect();
             for_lines(buf, |l| {
-                let Some([eid, uid, ts, ing, typ, pid, price]) = fields::<7>(l) else { return };
+                let Some([eid, uid, ts, ing, typ, pid, price]) = fields_fast::<7>(l) else { return };
                 if eid.is_empty() {
                     return;
                 }
@@ -619,39 +597,31 @@ fn main() {
                             ok = false;
                         } else {
                             pr = v as u32;
-                            cat = prod_ref.get(pid).unwrap_or(unknown_cat);
+                            cat = prod.get(pid).unwrap_or(unknown_cat);
                         }
                     }
                     _ => ok = false,
                 }
-                let (pk, nref) = if ok {
-                    let uh = xxh3_64(uid);
-                    match link.get(uh) {
-                        Some(x) => x,
-                        None => (uh, pack(uid)),
-                    }
-                } else {
-                    (0, 0)
-                };
-                let e = Ev { eid: [h as u64, (h >> 64) as u64], ingest, pk, nref, ts: tsv, price: pr, cat, ok };
+                let (uh, uref) = if ok { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
+                let e = Ev { eid: [h as u64, (h >> 64) as u64], ingest, uh, uref, ts: tsv, price: pr, cat, ok };
                 buckets[(h >> 64) as usize % NB].push(e);
             });
             buckets
         })
-        .collect();
-    log!("parsed events {:?}", t0.elapsed());
+        .collect()
+}
 
-    // ---------------- clicks: parse straight into person partitions
-    let cl_maps_ref = &cl_maps;
-    let camp_ref = &camp;
-    let cl_parts: Vec<Vec<Vec<ClP>>> = cl_chunks
+/// Parses every click file into one vector per chunk. `pk` holds the user
+/// hash until the link table resolves it to the person.
+fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, camp: &StrMap<u32>) -> Vec<Vec<ClP>> {
+    chunks
         .par_iter()
         .map(|c| {
-            let b: &[u8] = cl_maps_ref[c.file].as_ref().unwrap();
+            let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::new()).collect();
+            let mut v = Vec::with_capacity(buf.len() / 45 + 16);
             for_lines(buf, |l| {
-                let Some([cid, uid, cmp, ts]) = fields::<4>(l) else { return };
+                let Some([cid, uid, cmp, ts]) = fields_fast::<4>(l) else { return };
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
@@ -659,47 +629,207 @@ fn main() {
                 if t < cbase || t >= we {
                     return;
                 }
-                let Some(ci) = camp_ref.get(cmp) else { return };
-                let uh = xxh3_64(uid);
-                let pk = match link.get(uh) {
-                    Some(x) => x.0,
-                    None => uh,
-                };
-                parts[part_of(pk)].push(ClP { pk, cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
+                let Some(ci) = camp.get(cmp) else { return };
+                v.push(ClP { pk: xxh3_64(uid), cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
             });
+            v
+        })
+        .collect()
+}
+
+fn main() {
+    let t0 = Instant::now();
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
+    let ncpu: usize = std::env::var("NCPU").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    rayon::ThreadPoolBuilder::new().num_threads(ncpu).build_global().ok();
+
+    // manifest
+    let man = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
+    let grab = |k: &str| -> i64 {
+        let i = man.find(k).expect("key") + k.len();
+        let rest = &man[i..];
+        let q1 = rest.find('"').unwrap();
+        let rest = &rest[q1 + 1..];
+        let q2 = rest.find('"').unwrap();
+        parse_ts(rest[..q2].as_bytes()).expect("manifest ts")
+    };
+    let ws = grab("\"window_start\"");
+    let we = grab("\"window_end\"");
+    let cbase = ws - WEEK;
+
+    // map files first so the kernel can start reading while we build tables
+    let ev_paths = list_csv(&data.join("events"));
+    let cl_paths = list_csv(&data.join("clicks"));
+    let ln_paths = list_csv(&data.join("links"));
+    let ev_maps = map_files(&ev_paths);
+    let cl_maps = map_files(&cl_paths);
+    let ln_maps = map_files(&ln_paths);
+
+    // products and campaigns (small, clean); the raw buffers live to the end
+    let prod_raw: &'static [u8] = Box::leak(std::fs::read(data.join("products.csv")).unwrap_or_default().into_boxed_slice());
+    let camp_raw: &'static [u8] = Box::leak(std::fs::read(data.join("campaigns.csv")).unwrap_or_default().into_boxed_slice());
+    let mut cat_names: Vec<Vec<u8>> = vec![];
+    let mut cat_idx: HashMap<Vec<u8>, u16> = HashMap::new();
+    let mut prod: StrMap<u16> = StrMap::new();
+    {
+        let body = match memchr::memchr(b'\n', prod_raw) {
+            Some(h) => &prod_raw[h + 1..],
+            None => &prod_raw[0..0],
+        };
+        for_lines(body, |l| {
+            if let Some([p, c]) = fields_fast::<2>(l) {
+                let n = cat_idx.len() as u16;
+                let ci = *cat_idx.entry(c.to_vec()).or_insert_with(|| {
+                    cat_names.push(c.to_vec());
+                    n
+                });
+                prod.insert_first(p, ci);
+            }
+        });
+    }
+    let unknown_cat = match cat_idx.get(&b"unknown"[..]) {
+        Some(&c) => c,
+        None => {
+            cat_names.push(b"unknown".to_vec());
+            (cat_names.len() - 1) as u16
+        }
+    };
+    let ncat = cat_names.len();
+    let mut order: Vec<usize> = (0..ncat).collect();
+    order.sort_by(|a, b| cat_names[*a].cmp(&cat_names[*b]));
+    let mut cat_rank = vec![0usize; ncat];
+    for (r, &c) in order.iter().enumerate() {
+        cat_rank[c] = r;
+    }
+
+    let mut camp_names: Vec<Vec<u8>> = vec![];
+    let mut camp_chan: Vec<Vec<u8>> = vec![];
+    let mut camp: StrMap<u32> = StrMap::new();
+    {
+        let body = match memchr::memchr(b'\n', camp_raw) {
+            Some(h) => &camp_raw[h + 1..],
+            None => &camp_raw[0..0],
+        };
+        for_lines(body, |l| {
+            if let Some([c, ch]) = fields_fast::<2>(l) {
+                if camp.insert_first(c, camp_names.len() as u32) {
+                    camp_names.push(c.to_vec());
+                    camp_chan.push(ch.to_vec());
+                }
+            }
+        });
+    }
+    let organic = camp_names.len() as u32;
+    camp_names.push(b"organic".to_vec());
+    camp_chan.push(b"organic".to_vec());
+    let ncamp = camp_names.len();
+    log!("tables {:?}", t0.elapsed());
+
+    let target = 4 << 20;
+    let ev_chunks = chunks(&ev_maps, target);
+    let cl_chunks = chunks(&cl_maps, target);
+    let ln_chunks = chunks(&ln_maps, 1 << 20);
+
+    // ---------------- links on one worker, overlapped with parsing events and clicks
+    let (link, (parsed, cl_raw)) = rayon::join(
+        || build_links(&ln_maps, &ln_chunks),
+        || {
+            let p = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat);
+            log!("parsed events {:?}", t0.elapsed());
+            let c = parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp);
+            log!("parsed clicks {:?}", t0.elapsed());
+            (p, c)
+        },
+    );
+    let link = &link;
+    log!("linked {} ids, all parsed {:?}", link.n, t0.elapsed());
+
+    // ---------------- clicks: resolve persons, route to person partitions
+    let cl_parts: Vec<Vec<Vec<ClP>>> = cl_raw
+        .par_iter()
+        .map(|v| {
+            let per = v.len() / NP;
+            let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 4)).collect();
+            for i in 0..v.len() {
+                if i + 8 < v.len() {
+                    link.prefetch(v[i + 8].pk);
+                }
+                let mut c = v[i];
+                if let Some(x) = link.get(c.pk) {
+                    c.pk = x.0;
+                }
+                parts[part_of(c.pk)].push(c);
+            }
             parts
         })
         .collect();
-    log!("parsed clicks {:?}", t0.elapsed());
+    std::mem::forget(cl_raw);
+    log!("routed clicks {:?}", t0.elapsed());
 
-    // ---------------- dedup events per bucket, route survivors to person partitions
+    // ---------------- dedup events per bucket, resolve persons, route to person partitions
     let groups = (ncpu * 8).clamp(1, NB);
     let per_g = NB.div_ceil(groups);
     let parsed_ref = &parsed;
     let dd: Vec<Vec<Vec<EvP>>> = (0..groups)
         .into_par_iter()
         .map(|g| {
-            let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::new()).collect();
-            let mut all: Vec<Ev> = Vec::new();
-            for bi in g * per_g..((g + 1) * per_g).min(NB) {
-                all.clear();
-                for p in parsed_ref.iter() {
-                    all.extend_from_slice(&p[bi]);
+            let lo_b = g * per_g;
+            let hi_b = ((g + 1) * per_g).min(NB);
+            let n_est: usize = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).sum();
+            let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
+            // Open-addressing table of (low eid word, record) per bucket. The
+            // record kept for an event_id is its copy with the smallest ingest_ts.
+            let mut table: Vec<(u64, *const Ev)> = Vec::new();
+            let mut kept: Vec<*const Ev> = Vec::new();
+            for bi in lo_b..hi_b {
+                let n: usize = parsed_ref.iter().map(|p| p[bi].len()).sum();
+                if n == 0 {
+                    continue;
                 }
-                all.sort_unstable_by(|a, b| {
-                    (a.eid[1], a.eid[0], a.ingest).cmp(&(b.eid[1], b.eid[0], b.ingest))
-                });
-                let mut i = 0;
-                while i < all.len() {
-                    let e = all[i];
-                    let mut j = i + 1;
-                    while j < all.len() && all[j].eid == e.eid {
-                        j += 1;
+                let cap = (n * 2).next_power_of_two().max(16);
+                let mask = cap - 1;
+                table.clear();
+                table.resize(cap, (0, std::ptr::null()));
+                for p in parsed_ref.iter() {
+                    for e in p[bi].iter() {
+                        let mut s = (e.eid[0] as usize) & mask;
+                        loop {
+                            let (fp, cur) = table[s];
+                            if cur.is_null() {
+                                table[s] = (e.eid[0], e as *const Ev);
+                                break;
+                            }
+                            if fp == e.eid[0] {
+                                let c = unsafe { &*cur };
+                                if c.eid[1] == e.eid[1] {
+                                    if e.ingest < c.ingest {
+                                        table[s].1 = e as *const Ev;
+                                    }
+                                    break;
+                                }
+                            }
+                            s = (s + 1) & mask;
+                        }
                     }
+                }
+                kept.clear();
+                for &(_, ptr) in table.iter() {
+                    if ptr.is_null() {
+                        continue;
+                    }
+                    let e = unsafe { &*ptr };
                     if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
-                        parts[part_of(e.pk)].push(EvP { pk: e.pk, nref: e.nref, ts: e.ts, price: e.price, cat: e.cat });
+                        kept.push(ptr);
                     }
-                    i = j;
+                }
+                for i in 0..kept.len() {
+                    if i + 8 < kept.len() {
+                        link.prefetch(unsafe { (*kept[i + 8]).uh });
+                    }
+                    let e = unsafe { &*kept[i] };
+                    let (pk, nref) = link.get(e.uh).unwrap_or((e.uh, e.uref));
+                    parts[part_of(pk)].push(EvP { pk, nref, ts: e.ts, price: e.price, cat: e.cat });
                 }
             }
             parts
@@ -978,4 +1108,39 @@ fn main() {
     log!("done {:?}", t0.elapsed());
     // skip destructors of large structures
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn check_dir(dir: &Path) -> usize {
+        let mut n = 0;
+        let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += check_dir(&p);
+            } else if p.extension().map(|x| x == "csv").unwrap_or(false) {
+                let b = std::fs::read(&p).unwrap();
+                for line in b.split(|&c| c == b'\n') {
+                    assert_eq!(fields::<7>(line), fields_fast::<7>(line), "{:?}", String::from_utf8_lossy(line));
+                    assert_eq!(fields::<4>(line), fields_fast::<4>(line));
+                    assert_eq!(fields::<2>(line), fields_fast::<2>(line));
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+    #[test]
+    fn fast_splitter_matches_reference() {
+        let mut n = check_dir(Path::new("../kit/starter-duckdb/starter-duckdb/fixtures"));
+        n += check_dir(Path::new("../data/dev"));
+        for odd in [&b""[..], b",", b",,", b"\"", b"\"\"", b"\"a\"", b"a\"b", b"\"a", b"a\"", b"\"\"\"", b"x,\"y\",z,w", b"\"a\",\"b\"\r", b"a,b,c,d,e,f,g,h"] {
+            assert_eq!(fields::<2>(odd), fields_fast::<2>(odd));
+            assert_eq!(fields::<4>(odd), fields_fast::<4>(odd));
+            assert_eq!(fields::<7>(odd), fields_fast::<7>(odd));
+        }
+        assert!(n > 1_000_000, "checked {n} lines");
+    }
 }

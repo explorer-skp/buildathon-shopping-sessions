@@ -1,0 +1,39 @@
+name: check
+on: [push, workflow_dispatch]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the public starter, dev answer and generator
+        run: |
+          mkdir kit && cd kit
+          B=https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files
+          for f in starter-duckdb.zip dev-answer.zip generator.zip; do curl -fsSLO $B/$f; unzip -q $f; done
+          ls
+      - name: Build image
+        run: docker build --platform linux/amd64 -t entry .
+      - name: Fixtures
+        run: |
+          pip install -q polars
+          S=$(dirname $(find kit -name run_fixtures.py | head -1))
+          F=$(find kit -type d -name fixtures | head -1)
+          cat > run_in_docker.sh <<'X'
+          #!/bin/sh
+          docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
+            -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=2 -e MEM_GB=6 \
+            -v "$1":/data:ro -v "$2":/output -v /tmp/scratch:/scratch entry
+          X
+          chmod +x run_in_docker.sh; mkdir -p /tmp/scratch; chmod 777 /tmp/scratch
+          python3 $S/run_fixtures.py $F -- sh -c 'chmod 777 "$2"; ./run_in_docker.sh "$1" "$2"' _
+      - name: Dev set
+        run: |
+          G=$(dirname $(find kit -name Cargo.toml | head -1))
+          (cd $G && cargo build --release -q)
+          $G/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+          mkdir -p out && chmod 777 out
+          /usr/bin/time -v docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
+            -e NCPU=2 -e MEM_GB=6 -v $PWD/dev:/data:ro -v $PWD/out:/output -v /tmp/scratch:/scratch entry 2>&1 | grep -E "Elapsed|Exit"
+          S=$(dirname $(find kit -name compare.py | head -1))
+          A=$(dirname $(find kit -name user_daily.csv -path '*answer*' | head -1))
+          (cd $S && python3 compare.py $GITHUB_WORKSPACE/out $GITHUB_WORKSPACE/$A)
