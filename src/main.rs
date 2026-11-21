@@ -845,9 +845,11 @@ fn parse_events(
                 };
                 let mut pr = 0u32;
                 let mut cat = 0u16;
-                match typ {
-                    b"view" | b"cart" => {}
-                    b"purchase" => {
+                // view and cart (97% of rows) in one compare, no branch on which
+                let t4 = if typ.len() == 4 { u32::from_le_bytes([typ[0], typ[1], typ[2], typ[3]]) } else { 0 };
+                let view_or_cart = (t4 == u32::from_le_bytes(*b"view")) | (t4 == u32::from_le_bytes(*b"cart"));
+                if !view_or_cart {
+                    if typ == b"purchase" {
                         let mut v: u64 = 0;
                         let mut good = !price.is_empty();
                         for &ch in price {
@@ -868,8 +870,9 @@ fn parse_events(
                             pr = v as u32;
                             cat = prod.get(pid).unwrap_or(unknown_cat);
                         }
+                    } else {
+                        ok = false;
                     }
-                    _ => ok = false,
                 }
                 // the late rule needs only this copy's own times
                 let keep = ok && ingest - (tsv as i64 + ws) <= DAY;
