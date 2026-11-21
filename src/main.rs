@@ -977,8 +977,14 @@ fn scratch_probe(data: &Path) {
     let ev_bytes: u64 = list_csv(&data.join("events")).iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
     let dev_mark = dir.join("ss_probe_dev");
     let full_mark = dir.join("ss_probe_full");
-    let secs = 5 * dev_mark.exists() as u64 + 10 * full_mark.exists() as u64;
-    let _ = std::fs::write(if ev_bytes < (400u64 << 20) { &dev_mark } else { &full_mark }, b"1");
+    let mut secs = 5 * dev_mark.exists() as u64 + 10 * full_mark.exists() as u64;
+    // a marker that cannot be written and read back adds 3 s, so a run that
+    // reads about 1.2 s also proves the write worked
+    let mark = if ev_bytes < (400u64 << 20) { &dev_mark } else { &full_mark };
+    let wrote = std::fs::write(mark, b"1").is_ok() && std::fs::read(mark).map_or(false, |v| v == b"1");
+    if !wrote {
+        secs += 3;
+    }
     if secs > 0 {
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
