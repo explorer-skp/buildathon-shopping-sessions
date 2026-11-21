@@ -78,6 +78,76 @@ fn fields_fast<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(out)
 }
 
+/// Byte classes for the one-pass scanner: 1 comma, 2 quote, 3 newline.
+static CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    t[b',' as usize] = 1;
+    t[b'"' as usize] = 2;
+    t[b'\n' as usize] = 3;
+    t
+};
+
+/// Parses the line that starts at `*pos` into exactly N fields and moves
+/// `*pos` past its '\n'. Returns None for a malformed or empty line. Same
+/// result as `fields_fast` on the line `for_lines` would hand it.
+#[inline(always)]
+fn scan_fields<'a, const N: usize>(buf: &'a [u8], pos: &mut usize) -> Option<[&'a [u8]; N]> {
+    let len = buf.len();
+    let mut out: [&[u8]; N] = [&[]; N];
+    let mut k = 0usize;
+    let mut fstart = *pos;
+    let mut quotes = 0u32;
+    let mut bad = false;
+    let mut i = *pos;
+    while i < len {
+        let cl = CLASS[buf[i] as usize];
+        if cl == 0 {
+            i += 1;
+            continue;
+        }
+        if cl == 3 {
+            break;
+        }
+        if cl == 1 {
+            if !bad {
+                if k + 1 >= N {
+                    bad = true;
+                } else {
+                    match unquote(&buf[fstart..i], quotes) {
+                        Some(f) => {
+                            out[k] = f;
+                            k += 1;
+                        }
+                        None => bad = true,
+                    }
+                }
+            }
+            fstart = i + 1;
+            quotes = 0;
+        } else {
+            quotes += 1;
+        }
+        i += 1;
+    }
+    *pos = i + 1;
+    if bad || k + 1 != N {
+        return None;
+    }
+    out[k] = unquote(&buf[fstart..i], quotes)?;
+    Some(out)
+}
+
+/// Calls f with the fields of every well-formed line of a chunk.
+#[inline(always)]
+fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        if let Some(fs) = scan_fields::<N>(buf, &mut pos) {
+            f(fs);
+        }
+    }
+}
+
 /// Hint the CPU to pull a cache line in ahead of use.
 #[inline(always)]
 fn prefetch<T>(p: *const T) {
@@ -238,7 +308,18 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
             return Some(ms);
         }
     }
-    // F3: digits only
+    // F3: digits only. Up to 18 digits cannot overflow an i64.
+    if n <= 18 {
+        let mut v: i64 = 0;
+        for &c in b {
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as i64;
+        }
+        return Some(v);
+    }
     let mut v: i64 = 0;
     let mut big = false;
     for &c in b {
@@ -481,15 +562,17 @@ impl<V: Copy> StrMap<V> {
 /// Joins every link line into people and returns the table from an ID hash
 /// to (person key, person name). The person key is the hash of the person's
 /// byte-wise smallest ID, and the name points at that ID's bytes.
-fn build_links(maps: &[Option<Mmap>], chunks: &[Chunk]) -> LinkTable {
+type LinkPairs = Vec<Vec<(u64, u64, u64, u64)>>;
+
+/// Parallel part of linking: parse link lines and list every distinct ID.
+fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (LinkPairs, Vec<(u64, u64)>) {
     let ln_parsed: Vec<Vec<(u64, u64, u64, u64)>> = chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::new();
-            for_lines(buf, |l| {
-                let Some([a, bb]) = fields_fast::<2>(l) else { return };
+            for_records::<2>(buf, |[a, bb]| {
                 if a.is_empty() || bb.is_empty() {
                     return;
                 }
@@ -504,6 +587,12 @@ fn build_links(maps: &[Option<Mmap>], chunks: &[Chunk]) -> LinkTable {
         .collect();
     ids.par_sort_unstable_by_key(|x| x.0);
     ids.dedup_by_key(|x| x.0);
+    (ln_parsed, ids)
+}
+
+/// Sequential part of linking: union-find and the final lookup table. Runs on
+/// its own thread while the pool parses events and clicks.
+fn link_table(ln_parsed: LinkPairs, ids: Vec<(u64, u64)>) -> LinkTable {
     let n_ids = ids.len();
     let mut dense = LinkTable::new(n_ids);
     for (i, x) in ids.iter().enumerate() {
@@ -559,8 +648,7 @@ fn parse_events(
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(buf.len() / 70 / NB + 8)).collect();
-            for_lines(buf, |l| {
-                let Some([eid, uid, ts, ing, typ, pid, price]) = fields_fast::<7>(l) else { return };
+            for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
                 }
@@ -620,8 +708,7 @@ fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, ca
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::with_capacity(buf.len() / 45 + 16);
-            for_lines(buf, |l| {
-                let Some([cid, uid, cmp, ts]) = fields_fast::<4>(l) else { return };
+            for_records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
@@ -732,16 +819,14 @@ fn main() {
     let ln_chunks = chunks(&ln_maps, 1 << 20);
 
     // ---------------- links on one worker, overlapped with parsing events and clicks
-    let (link, (parsed, cl_raw)) = rayon::join(
-        || build_links(&ln_maps, &ln_chunks),
-        || {
-            let p = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat);
-            log!("parsed events {:?}", t0.elapsed());
-            let c = parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp);
-            log!("parsed clicks {:?}", t0.elapsed());
-            (p, c)
-        },
-    );
+    let (ln_parsed, ids) = link_ids(&ln_maps, &ln_chunks);
+    log!("link ids {:?}", t0.elapsed());
+    let link_thread = std::thread::spawn(move || link_table(ln_parsed, ids));
+    let parsed = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat);
+    log!("parsed events {:?}", t0.elapsed());
+    let cl_raw = parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp);
+    log!("parsed clicks {:?}", t0.elapsed());
+    let link = link_thread.join().expect("link thread");
     let link = &link;
     log!("linked {} ids, all parsed {:?}", link.n, t0.elapsed());
 
@@ -789,8 +874,9 @@ fn main() {
                 }
                 let cap = (n * 2).next_power_of_two().max(16);
                 let mask = cap - 1;
-                table.clear();
-                table.resize(cap, (0, std::ptr::null()));
+                if table.len() < cap {
+                    table.resize(cap, (0, std::ptr::null()));
+                }
                 for p in parsed_ref.iter() {
                     for e in p[bi].iter() {
                         let mut s = (e.eid[0] as usize) & mask;
@@ -814,10 +900,12 @@ fn main() {
                     }
                 }
                 kept.clear();
-                for &(_, ptr) in table.iter() {
+                for slot in table[..cap].iter_mut() {
+                    let ptr = slot.1;
                     if ptr.is_null() {
                         continue;
                     }
+                    *slot = (0, std::ptr::null());
                     let e = unsafe { &*ptr };
                     if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
                         kept.push(ptr);
@@ -1142,5 +1230,22 @@ mod tests {
             assert_eq!(fields::<7>(odd), fields_fast::<7>(odd));
         }
         assert!(n > 1_000_000, "checked {n} lines");
+        for d in ["../data/dev/events", "../data/dev/clicks", "../data/dev/links"] {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let b = std::fs::read(e.path()).unwrap();
+                let mut want7 = vec![]; let mut want4 = vec![]; let mut want2 = vec![];
+                for_lines(&b, |l| { if let Some(x) = fields_fast::<7>(l) { want7.push(x) } if let Some(x) = fields_fast::<4>(l) { want4.push(x) } if let Some(x) = fields_fast::<2>(l) { want2.push(x) } });
+                let mut got7 = vec![]; let mut got4 = vec![]; let mut got2 = vec![];
+                for_records::<7>(&b, |x| got7.push(x));
+                for_records::<4>(&b, |x| got4.push(x));
+                for_records::<2>(&b, |x| got2.push(x));
+                assert_eq!(want7, got7); assert_eq!(want4, got4); assert_eq!(want2, got2);
+            }
+        }
+        for odd in [&b"a,b\n\nc,d\n"[..], b"\n\n", b"a,b", b"a,b\n", b"\"a\",\"b\"\n\"x\"y,z\n", b"a,b,c\nd,e\n"] {
+            let mut want = vec![]; for_lines(odd, |l| if let Some(x) = fields_fast::<2>(l) { want.push(x) });
+            let mut got = vec![]; for_records::<2>(odd, |x| got.push(x));
+            assert_eq!(want, got);
+        }
     }
 }
