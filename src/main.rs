@@ -814,7 +814,10 @@ fn parse_events(
             let buf = &b[c.start..c.end];
             let mut recs: Vec<Vec<Rec>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 70 / nlb + 16)).collect();
             let mut purch: Vec<(u32, u16)> = Vec::new();
+            // dedup keys die after dedup, so they live in the scratch region
+            bump::select(1);
             let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
+            bump::select(0);
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
@@ -898,7 +901,10 @@ fn parse_clicks(
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
+            // raw clicks die once routed, so they live in the scratch region
+            bump::select(1);
             let mut v: Vec<Vec<ClP>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 45 / nlb + 16)).collect();
+            bump::select(0);
             scan::for_records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
@@ -1154,6 +1160,8 @@ fn main() {
         })
         .collect();
     std::mem::forget(cl_raw);
+    // dedup keys and raw clicks are dead: their memory takes the routed events
+    bump::reset(1);
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- kept events: resolve persons one table slice at a time, route to person partitions
@@ -1162,7 +1170,9 @@ fn main() {
         .map(|b| {
             let mut purch: Vec<(u32, u16)> = Vec::new();
             let n_est: usize = ev_recs.iter().map(|r| r[b].len()).sum();
+            bump::select(1);
             let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
+            bump::select(0);
             for c in 0..ev_recs.len() {
                 let recs = &ev_recs[c][b];
                 let lw = &losers[c][b];
