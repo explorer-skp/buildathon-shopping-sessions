@@ -72,44 +72,100 @@ fn masks(p: *const u8) -> (u64, u64, u64) {
     }
 }
 
+/// Bit i set when an odd number of bits of x are set at positions <= i.
+#[inline(always)]
+fn prefix_xor(mut x: u64) -> u64 {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    x ^= x << 32;
+    x
+}
+
+/// Masks of the 64 bytes at `blk`, reading a zero-padded copy for a short tail.
+#[inline(always)]
+fn block(buf: &[u8], blk: usize) -> (u64, u64, u64) {
+    if blk + 64 <= buf.len() {
+        masks(unsafe { buf.as_ptr().add(blk) })
+    } else {
+        let mut tail = [0u8; 64];
+        tail[..buf.len() - blk].copy_from_slice(&buf[blk..]);
+        masks(tail.as_ptr())
+    }
+}
+
 /// Calls f with the fields of every well-formed line of a chunk.
+///
+/// Quotes are checked a block at a time: with the running quote parity, an
+/// opening quote must follow a delimiter (or start the line), a closing quote
+/// must precede one (or end the buffer), and no delimiter may sit inside
+/// quotes. Exactly the lines breaking one of these have a field with quotes
+/// other than one pair around all of it, so those lines are dropped and every
+/// field of the others is stripped of its pair when it starts with a quote.
 #[inline(always)]
 pub fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let len = buf.len();
+    if len == 0 {
+        return;
+    }
     let base = buf.as_ptr();
     let mut out: [&'a [u8]; N] = [&[]; N];
     let mut k = 0usize; // fields closed in the current line
-    let mut bad = false;
+    let mut bad = false; // the current line breaks a quote rule
     let mut fs = 0usize; // current field start
     let mut ls = 0usize; // current line start
-    let mut qb = 0u32; // quotes before this block
-    let mut qs = 0u32; // quotes before fs
+    let mut pdelim = 1u64; // the byte before this block ends a field (or there is none)
+    let mut carry = 0u64; // quote parity carried in: 0 or all ones
+    let mut cur = block(buf, 0);
     let mut blk = 0usize;
     while blk < len {
-        let (c, q, nl) = if blk + 64 <= len {
-            masks(unsafe { base.add(blk) })
+        let (c, q, nl) = cur;
+        let nblk = blk + 64;
+        let next = if nblk < len { block(buf, nblk) } else { (0, 0, 0) };
+        let d = c | nl;
+        // a byte is followed by a delimiter, or by the end of the buffer
+        let after = if nblk < len {
+            ((next.0 | next.2) & 1) << 63
+        } else if nblk == len {
+            1u64 << 63
         } else {
-            let mut tail = [0u8; 64];
-            tail[..len - blk].copy_from_slice(&buf[blk..]);
-            masks(tail.as_ptr())
+            1u64 << (len - blk - 1)
         };
-        let mut d = c | nl;
-        while d != 0 {
-            let i = d.trailing_zeros();
-            d &= d - 1;
+        let next_d = (d >> 1) | after;
+        let prev_d = (d << 1) | pdelim;
+        let mut px = prefix_xor(q) ^ carry;
+        if nl & px != 0 {
+            // a line ended inside quotes: restart the parity after its newline
+            let mut m = nl;
+            while m != 0 {
+                let j = m.trailing_zeros();
+                m &= m - 1;
+                if (px >> j) & 1 != 0 && j < 63 {
+                    px ^= !0u64 << (j + 1);
+                }
+            }
+        }
+        let mut amask = (d & px) | (q & px & !prev_d) | (q & !px & !next_d);
+        carry = if (px >> 63) & 1 != 0 && (nl >> 63) & 1 == 0 { !0 } else { 0 };
+        pdelim = d >> 63;
+        let mut dd = d;
+        while dd != 0 {
+            let i = dd.trailing_zeros();
+            dd &= dd - 1;
             let pos = blk + i as usize;
-            let qn = qb + (q & ((1u64 << i) - 1)).count_ones();
-            let nq = qn - qs;
-            // fs <= pos < len, so both reads are inside buf; they only matter when nq == 2
-            let first = unsafe { *base.add(fs) };
-            let last = unsafe { *base.add(pos.saturating_sub(1)) };
-            let wrapped = (nq == 2) & (first == b'"') & (last == b'"');
-            let w = wrapped as usize;
-            out[k.min(N - 1)] = unsafe { std::slice::from_raw_parts(base.add(fs + w), pos - fs - 2 * w) };
-            bad |= !((nq == 0) | wrapped) | (k >= N);
+            if amask != 0 {
+                let lm = u64::MAX >> (63 - i);
+                bad |= amask & lm != 0;
+                amask &= !lm;
+            }
+            // fs <= pos < len: a field that starts with a quote is wrapped in one pair
+            let w = (unsafe { *base.add(fs) } == b'"') as usize;
+            out[k.min(N - 1)] =
+                unsafe { std::slice::from_raw_parts(base.add(fs + w), (pos - fs).saturating_sub(2 * w)) };
             k += 1;
             fs = pos + 1;
-            qs = qn;
             if (nl >> i) & 1 != 0 {
                 if !bad & (k == N) {
                     f(out);
@@ -119,16 +175,17 @@ pub fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8
                 ls = fs;
             }
         }
-        qb += q.count_ones();
-        blk += 64;
+        bad |= amask != 0;
+        cur = next;
+        blk = nblk;
     }
     if ls < len {
-        // a last line with no newline
-        let nq = qb - qs;
-        let fld = &buf[fs..];
-        let wrapped = nq == 2 && fld.len() >= 2 && fld[0] == b'"' && fld[fld.len() - 1] == b'"';
-        if !bad && (nq == 0 || wrapped) && k + 1 == N {
-            out[k] = if wrapped { &fld[1..fld.len() - 1] } else { fld };
+        // a last line with no newline: its quotes must be closed at the end
+        bad |= carry != 0;
+        if !bad && k + 1 == N {
+            let fld = &buf[fs..];
+            let w = (fld.first() == Some(&b'"')) as usize;
+            out[k] = &fld[w..fld.len() - w];
             f(out);
         }
     }
