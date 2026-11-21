@@ -20,9 +20,10 @@ jobs:
           F=$(find kit -type d -name fixtures | head -1)
           cat > run_in_docker.sh <<'X'
           #!/bin/sh
+          D=$(cd "$1" && pwd); O=$(cd "$2" && pwd)
           docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
             -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=2 -e MEM_GB=6 \
-            -v "$1":/data:ro -v "$2":/output -v /tmp/scratch:/scratch entry
+            -v "$D":/data:ro -v "$O":/output -v /tmp/scratch:/scratch entry
           X
           chmod +x run_in_docker.sh; mkdir -p /tmp/scratch; chmod 777 /tmp/scratch
           python3 $S/run_fixtures.py $F -- sh -c 'chmod 777 "$2"; ./run_in_docker.sh "$1" "$2"' _
