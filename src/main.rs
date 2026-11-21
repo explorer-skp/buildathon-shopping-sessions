@@ -1151,7 +1151,10 @@ fn main() {
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- kept events: resolve persons one table slice at a time, route to person partitions
-    let (dd, purchases): (Vec<Vec<Vec<EvP>>>, Vec<Vec<(u32, u16)>>) = (0..nlb)
+    // heavy users make some slices much larger: start those first
+    let mut slice_order: Vec<usize> = (0..nlb).collect();
+    slice_order.sort_by_key(|&b| std::cmp::Reverse(ev_recs.iter().map(|r| r[b].len()).sum::<usize>()));
+    let routed: Vec<(usize, Vec<Vec<EvP>>, Vec<(u32, u16)>)> = slice_order
         .into_par_iter()
         .map(|b| {
             let mut purch: Vec<(u32, u16)> = Vec::new();
@@ -1180,9 +1183,15 @@ fn main() {
                     parts[part_of(pk)].push(EvP { pk, nref, ts: r.ts, aux });
                 }
             }
-            (parts, purch)
+            (b, parts, purch)
         })
-        .unzip();
+        .collect();
+    let mut dd: Vec<Vec<Vec<EvP>>> = Vec::with_capacity(nlb);
+    let mut purchases: Vec<Vec<(u32, u16)>> = (0..nlb).map(|_| Vec::new()).collect();
+    for (b, parts, purch) in routed {
+        dd.push(parts);
+        purchases[b] = purch;
+    }
     let purchases = &purchases;
     std::mem::forget(ev_recs);
     log!("routed events {:?}", t0.elapsed());
@@ -1215,7 +1224,11 @@ fn main() {
     let camp_accs: Vec<std::sync::Mutex<Vec<[u64; 4]>>> =
         (0..rayon::current_num_threads().max(1)).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let camp_accs = &camp_accs;
-    let mut parts: Vec<Part> = (0..tasks)
+    let mut task_order: Vec<usize> = (0..tasks).collect();
+    task_order.sort_by_key(|&t| {
+        std::cmp::Reverse((t * per_t..((t + 1) * per_t).min(NP)).map(|p| dd.iter().map(|g| g[p].len()).sum::<usize>()).sum::<usize>())
+    });
+    let mut parts: Vec<Part> = task_order
         .into_par_iter()
         .map(|t| {
             // campaign totals per worker thread: tasks on one thread never overlap
