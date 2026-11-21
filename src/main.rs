@@ -650,6 +650,7 @@ fn sort_evp(g: &mut [EvP], keys: &mut Vec<u64>, wide: &mut Vec<u128>, tmp: &mut 
 /// the person key first. A counting pass on the `sb` key bits right below the
 /// partition bits splits the rows into small groups, then each group gets an
 /// insertion sort. Returns the row count.
+#[cfg_attr(feature = "prof", inline(never))]
 fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     src: I,
     sb: u32,

@@ -45,7 +45,8 @@ fn eight(v: u64) -> u64 {
     (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42949672960001) >> 32
 }
 
-#[inline(always)]
+#[cfg_attr(not(feature = "prof"), inline(always))]
+#[cfg_attr(feature = "prof", inline(never))]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 13 {
