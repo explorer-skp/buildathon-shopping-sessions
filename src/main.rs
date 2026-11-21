@@ -1079,9 +1079,9 @@ fn main() {
     );
     let (cat_names, prod, unknown_cat, ncat, cat_rank, camp_names, camp_chan, camp, organic, ncamp) = tables;
     log!("tables and link ids {:?}", t0.elapsed());
-    // slices of 16k slots (256 KB), at most 256 of them
+    // slices of 32k slots (512 KB), at most 256 of them (256 KB measured 4% slower)
     let lcap = LinkTable::cap_for(n_ids);
-    let lshift_env: i32 = std::env::var("SS_LSLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(14);
+    let lshift_env: i32 = std::env::var("SS_LSLICE").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
     let lbits = (lcap.trailing_zeros() as i32 - lshift_env).clamp(0, 8) as u32;
     let nlb = 1usize << lbits;
     let lb = Lb { mask: lcap - 1, shift: lcap.trailing_zeros() - lbits };
