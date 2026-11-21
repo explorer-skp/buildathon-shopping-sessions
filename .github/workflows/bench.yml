@@ -42,6 +42,15 @@ jobs:
           # optional switch A/B on the new image, set in bench_ab.txt as: label env-args
           if [ -f bench_ab.txt ] && [ "$(cat bench_ab.txt)" != none ]; then read -r LAB ARGS < bench_ab.txt; for i in 1 2 3; do run entry "C($LAB)" $ARGS; run entry "B2"; done; fi
           for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
+          for i in 1 2 3; do
+            sudo rm -rf out && mkdir out && chmod 777 out
+            s=$(date +%s%N)
+            docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m -e NCPU=$(nproc) -e MEM_GB=12 -e SS_STAMP=1 \
+              -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch entry 2> stamps.txt
+            e=$(date +%s%N)
+            a=$(grep "stamp start" stamps.txt | cut -d' ' -f3); b=$(grep "stamp end" stamps.txt | cut -d' ' -f3)
+            echo "split: before main $(( (a - s) / 1000000 )) ms, main $(( (b - a) / 1000000 )) ms, after exit $(( (e - b) / 1000000 )) ms"
+          done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
       - name: Exit cost (native run)

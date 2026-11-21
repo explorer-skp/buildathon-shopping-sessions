@@ -932,7 +932,15 @@ fn parse_clicks(
         .collect()
 }
 
+fn stamp(what: &str) {
+    if std::env::var_os("SS_STAMP").is_some() {
+        let ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        eprintln!("stamp {what} {ns}");
+    }
+}
+
 fn main() {
+    stamp("start");
     bump::init();
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
@@ -1625,6 +1633,7 @@ fn main() {
         log!("released inputs {:?}", t0.elapsed());
     }
     // skip destructors of large structures
+    stamp("end");
     std::process::exit(0);
 }
 
