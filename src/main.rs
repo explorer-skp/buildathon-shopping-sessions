@@ -527,7 +527,6 @@ struct ClP {
     camp: u32,
 }
 
-const NB: usize = 512; // event dedup buckets (by event_id hash)
 const PB: u32 = 10; // person partitions = 1 << PB (by person key)
 const NP: usize = 1 << PB;
 
@@ -720,13 +719,14 @@ fn parse_events(
     we: i64,
     prod: &StrMap<u16>,
     unknown_cat: u16,
+    nb: usize,
 ) -> Vec<Vec<Vec<Ev>>> {
     chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(buf.len() / 70 / NB + 8)).collect();
+            let mut buckets: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
@@ -771,7 +771,7 @@ fn parse_events(
                 }
                 let (uh, uref) = if ok { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
                 let e = Ev { eid: [h as u64, (h >> 64) as u64], ingest, uh, uref, ts: tsv, price: pr, cat, ok };
-                buckets[(h >> 64) as usize % NB].push(e);
+                buckets[(h >> 64) as usize & (nb - 1)].push(e);
             });
             buckets
         })
@@ -893,16 +893,19 @@ fn main() {
     let ncamp = camp_names.len();
     log!("tables {:?}", t0.elapsed());
 
-    let target = 4 << 20;
-    let ev_chunks = chunks(&ev_maps, target);
-    let cl_chunks = chunks(&cl_maps, target);
+    // dedup buckets of about 40k copies keep each bucket's table in L2; chunks
+    // grow with the bucket count so each chunk still fills its buckets
+    let ev_bytes: usize = ev_maps.iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
+    let nb = (ev_bytes / 76 / 40_000).next_power_of_two().clamp(256, 4096);
+    let ev_chunks = chunks(&ev_maps, (4usize << 20) * nb / 512);
+    let cl_chunks = chunks(&cl_maps, 4 << 20);
     let ln_chunks = chunks(&ln_maps, 1 << 20);
 
     // ---------------- links on one worker, overlapped with parsing events and clicks
     let (ln_parsed, ids) = link_ids(&ln_maps, &ln_chunks);
     log!("link ids {:?}", t0.elapsed());
     let link_thread = std::thread::spawn(move || link_table(ln_parsed, ids));
-    let parsed = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat);
+    let parsed = parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb);
     log!("parsed events {:?}", t0.elapsed());
     let cl_raw = parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp);
     log!("parsed clicks {:?}", t0.elapsed());
@@ -933,67 +936,97 @@ fn main() {
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- dedup events per bucket, resolve persons, route to person partitions
-    let groups = (ncpu * 8).clamp(1, NB);
-    let per_g = NB.div_ceil(groups);
+    let groups = (ncpu * 8).clamp(1, nb);
+    let per_g = nb.div_ceil(groups);
     let parsed_ref = &parsed;
     let dd: Vec<Vec<Vec<EvP>>> = (0..groups)
         .into_par_iter()
         .map(|g| {
             let lo_b = g * per_g;
-            let hi_b = ((g + 1) * per_g).min(NB);
+            let hi_b = ((g + 1) * per_g).min(nb);
             let n_est: usize = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).sum();
             let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
-            // Open-addressing table of (low eid word, record) per bucket. The
-            // record kept for an event_id is its copy with the smallest ingest_ts.
-            let mut table: Vec<(u64, *const Ev)> = Vec::new();
+            // Open-addressing table per bucket, 8 bytes a slot: fingerprint << 32 |
+            // (index + 1), where the index counts the bucket's copies in file order.
+            // The copy kept for an event_id has the smallest ingest_ts, the earliest on ties.
+            let mut table: Vec<u64> = Vec::new();
+            let mut start: Vec<u32> = Vec::with_capacity(parsed_ref.len() + 1);
+            let mut base: Vec<*const Ev> = Vec::with_capacity(parsed_ref.len());
             let mut kept: Vec<*const Ev> = Vec::new();
             for bi in lo_b..hi_b {
-                let n: usize = parsed_ref.iter().map(|p| p[bi].len()).sum();
+                start.clear();
+                base.clear();
+                let mut n = 0u32;
+                for p in parsed_ref.iter() {
+                    start.push(n);
+                    base.push(p[bi].as_ptr());
+                    n += p[bi].len() as u32;
+                }
+                start.push(n);
                 if n == 0 {
                     continue;
                 }
-                let cap = (n * 2).next_power_of_two().max(16);
+                let at = |i: u32| -> &Ev {
+                    let c = start.partition_point(|&s| s <= i) - 1;
+                    unsafe { &*base[c].add((i - start[c]) as usize) }
+                };
+                let cap = (n as usize * 3 / 2).next_power_of_two().max(16);
                 let mask = cap - 1;
-                if table.len() < cap {
-                    table.resize(cap, (0, std::ptr::null()));
-                }
+                table.clear();
+                table.resize(cap, 0);
+                let mut i = 0u64;
                 for p in parsed_ref.iter() {
                     for e in p[bi].iter() {
+                        let fp = e.eid[0] >> 32;
                         let mut s = (e.eid[0] as usize) & mask;
                         loop {
-                            let (fp, cur) = table[s];
-                            if cur.is_null() {
-                                table[s] = (e.eid[0], e as *const Ev);
+                            let v = table[s];
+                            if v == 0 {
+                                table[s] = (fp << 32) | (i + 1);
                                 break;
                             }
-                            if fp == e.eid[0] {
-                                let c = unsafe { &*cur };
-                                if c.eid[1] == e.eid[1] {
+                            if v >> 32 == fp {
+                                let c = at(v as u32 - 1);
+                                if c.eid == e.eid {
                                     if e.ingest < c.ingest {
-                                        table[s].1 = e as *const Ev;
+                                        table[s] = (fp << 32) | (i + 1);
                                     }
                                     break;
                                 }
                             }
                             s = (s + 1) & mask;
                         }
+                        i += 1;
                     }
                 }
+                // walk the copies again in file order and keep each winner
                 kept.clear();
-                for slot in table[..cap].iter_mut() {
-                    let ptr = slot.1;
-                    if ptr.is_null() {
-                        continue;
-                    }
-                    *slot = (0, std::ptr::null());
-                    let e = unsafe { &*ptr };
-                    if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
-                        kept.push(ptr);
+                let mut i = 0u64;
+                for p in parsed_ref.iter() {
+                    for e in p[bi].iter() {
+                        let fp = e.eid[0] >> 32;
+                        let mut s = (e.eid[0] as usize) & mask;
+                        loop {
+                            let v = table[s];
+                            if v >> 32 == fp {
+                                if v & 0xFFFF_FFFF == i + 1 {
+                                    if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
+                                        kept.push(e as *const Ev);
+                                    }
+                                    break;
+                                }
+                                if at(v as u32 - 1).eid == e.eid {
+                                    break;
+                                }
+                            }
+                            s = (s + 1) & mask;
+                        }
+                        i += 1;
                     }
                 }
                 for i in 0..kept.len() {
-                    if i + 8 < kept.len() {
-                        link.prefetch(unsafe { (*kept[i + 8]).uh });
+                    if i + 16 < kept.len() {
+                        link.prefetch(unsafe { (*kept[i + 16]).uh });
                     }
                     let e = unsafe { &*kept[i] };
                     let (pk, nref) = link.get(e.uh).unwrap_or((e.uh, e.uref));
@@ -1027,7 +1060,8 @@ fn main() {
         .into_par_iter()
         .map(|t| {
             let mut camp_acc = vec![[0u64; 4]; ncamp * ndays];
-            let mut rows = Vec::new();
+            let n_task: usize = (t * per_t..((t + 1) * per_t).min(NP)).map(|p| dd_ref.iter().map(|g| g[p].len()).sum::<usize>()).sum();
+            let mut rows = Vec::with_capacity(n_task / 6 + 64);
             let mut catrev = vec![0u64; ncat];
             let mut starts: Vec<i64> = Vec::new();
             let mut sess_days: Vec<usize> = Vec::new();
@@ -1257,7 +1291,8 @@ fn main() {
         }
     }
 
-    // ---------------- write outputs
+    // ---------------- write outputs (the writer frees and reallocates buffers, so use the system allocator)
+    bump::stop();
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();

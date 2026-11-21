@@ -6,13 +6,14 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Bump;
 
 static BASE: AtomicUsize = AtomicUsize::new(0);
 static END: AtomicUsize = AtomicUsize::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+static ON: AtomicBool = AtomicBool::new(true);
 const MIN: usize = 1024;
 const BLOCK: usize = 4 << 20;
 const HUGE: usize = 2 << 20;
@@ -50,6 +51,17 @@ pub fn init() {
             return;
         }
     }
+}
+
+/// Sends later allocations to the system allocator, which reuses freed
+/// memory. Blocks already handed out stay valid.
+pub fn stop() {
+    ON.store(false, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn on() -> bool {
+    BASE.load(Ordering::Relaxed) != 0 && ON.load(Ordering::Relaxed)
 }
 
 #[inline(always)]
@@ -90,7 +102,7 @@ fn bump(size: usize, align: usize) -> *mut u8 {
 unsafe impl GlobalAlloc for Bump {
     #[inline]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() >= MIN && l.align() <= 4096 && BASE.load(Ordering::Relaxed) != 0 {
+        if l.size() >= MIN && l.align() <= 4096 && on() {
             let p = bump(l.size(), l.align());
             if !p.is_null() {
                 return p;
@@ -101,7 +113,7 @@ unsafe impl GlobalAlloc for Bump {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        if l.size() >= MIN && l.align() <= 4096 && BASE.load(Ordering::Relaxed) != 0 {
+        if l.size() >= MIN && l.align() <= 4096 && on() {
             // fresh region memory is already zero
             let p = bump(l.size(), l.align());
             if !p.is_null() {
@@ -129,7 +141,7 @@ unsafe impl GlobalAlloc for Bump {
             }
             return q;
         }
-        if new >= MIN && l.align() <= 4096 && BASE.load(Ordering::Relaxed) != 0 {
+        if new >= MIN && l.align() <= 4096 && on() {
             let q = bump(new, l.align());
             if !q.is_null() {
                 unsafe {
