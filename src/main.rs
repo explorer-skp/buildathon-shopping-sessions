@@ -564,6 +564,78 @@ impl<V: Copy> StrMap<V> {
     }
 }
 
+/// Gathers the slices into `out` in the order of `less`, which must order by
+/// the person key first. A counting pass on the `sb` key bits right below the
+/// partition bits splits the rows into small groups, then each group gets an
+/// insertion sort. Returns the row count.
+fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
+    src: I,
+    sb: u32,
+    key: impl Fn(&T) -> u64,
+    less: impl Fn(&T, &T) -> bool,
+    cnt: &mut [u32],
+    out: &mut Vec<T>,
+) -> usize {
+    let ng = 1usize << sb;
+    let sub = |x: &T| ((key(x) << PB) >> (64 - sb)) as usize;
+    cnt[..ng + 1].fill(0);
+    let mut n = 0usize;
+    for s in src.clone() {
+        n += s.len();
+        for x in s {
+            cnt[sub(x) + 1] += 1;
+        }
+    }
+    out.clear();
+    if n == 0 {
+        return 0;
+    }
+    for b in 0..ng {
+        cnt[b + 1] += cnt[b];
+    }
+    out.reserve(n);
+    let dst = out.as_mut_ptr();
+    for s in src {
+        for x in s {
+            let b = sub(x);
+            unsafe { dst.add(cnt[b] as usize).write(*x) };
+            cnt[b] += 1;
+        }
+    }
+    unsafe { out.set_len(n) };
+    // cnt[b] is now the end of group b
+    let mut lo = 0usize;
+    for b in 0..ng {
+        let hi = cnt[b] as usize;
+        if hi - lo > 1 {
+            let g = &mut out[lo..hi];
+            if g.len() <= 32 {
+                for i in 1..g.len() {
+                    let x = g[i];
+                    let mut j = i;
+                    while j > 0 && less(&x, &g[j - 1]) {
+                        g[j] = g[j - 1];
+                        j -= 1;
+                    }
+                    g[j] = x;
+                }
+            } else {
+                g.sort_unstable_by(|a, b| {
+                    if less(a, b) {
+                        std::cmp::Ordering::Less
+                    } else if less(b, a) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                });
+            }
+        }
+        lo = hi;
+    }
+    n
+}
+
 // ------------------------------------------------------------------ phases
 
 /// Joins every link line into people and returns the table from an ID hash
@@ -946,6 +1018,10 @@ fn main() {
     }
     let dd_ref = &dd;
     let cl_ref = &cl_parts;
+    let old_sort = std::env::var_os("SS_OLDSORT").is_some();
+    // group bits below the partition bits: about 8 events per group
+    let n_kept: usize = dd.iter().map(|g| g.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let sb = ((n_kept / NP / 8).max(1).ilog2()).clamp(4, 16);
     let cat_rank = &cat_rank;
     let mut parts: Vec<Part> = (0..tasks)
         .into_par_iter()
@@ -958,22 +1034,48 @@ fn main() {
             let mut evs: Vec<EvP> = Vec::new();
             let mut cls: Vec<ClP> = Vec::new();
             let mut byc: Vec<(u32, i64)> = Vec::new();
+            let mut cnt: Vec<u32> = vec![0; (1 << sb) + 1];
             for p in t * per_t..((t + 1) * per_t).min(NP) {
-                evs.clear();
-                for g in dd_ref.iter() {
-                    evs.extend_from_slice(&g[p]);
+                if old_sort {
+                    evs.clear();
+                    for g in dd_ref.iter() {
+                        evs.extend_from_slice(&g[p]);
+                    }
+                    if evs.is_empty() {
+                        continue;
+                    }
+                    cls.clear();
+                    for c in cl_ref.iter() {
+                        cls.extend_from_slice(&c[p]);
+                    }
+                    evs.sort_unstable_by_key(|e| (e.pk, e.ts));
+                    cls.sort_unstable_by(|a, b| {
+                        (a.pk, a.ts).cmp(&(b.pk, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
+                    });
+                } else {
+                    let n = group_sort(
+                        dd_ref.iter().map(|g| &g[p][..]),
+                        sb,
+                        |e: &EvP| e.pk,
+                        |a: &EvP, b: &EvP| (a.pk, a.ts) < (b.pk, b.ts),
+                        &mut cnt,
+                        &mut evs,
+                    );
+                    if n == 0 {
+                        continue;
+                    }
+                    group_sort(
+                        cl_ref.iter().map(|c| &c[p][..]),
+                        sb,
+                        |c: &ClP| c.pk,
+                        |a: &ClP, b: &ClP| {
+                            (a.pk, a.ts).cmp(&(b.pk, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
+                                == std::cmp::Ordering::Less
+                        },
+                        &mut cnt,
+                        &mut cls,
+                    );
                 }
-                if evs.is_empty() {
-                    continue;
-                }
-                cls.clear();
-                for c in cl_ref.iter() {
-                    cls.extend_from_slice(&c[p]);
-                }
-                evs.sort_unstable_by_key(|e| (e.pk, e.ts));
-                cls.sort_unstable_by(|a, b| {
-                    (a.pk, a.ts).cmp(&(b.pk, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
-                });
                 let mut ci = 0usize;
                 let mut i = 0usize;
                 while i < evs.len() {
