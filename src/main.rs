@@ -10,6 +10,7 @@ use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
 mod pq;
+mod scan;
 
 /// Keys are already xxh3 hashes: pass them straight through.
 #[derive(Default, Clone, Copy)]
@@ -139,6 +140,7 @@ fn scan_fields<'a, const N: usize>(buf: &'a [u8], pos: &mut usize) -> Option<[&'
 
 /// Calls f with the fields of every well-formed line of a chunk.
 #[inline(always)]
+#[allow(dead_code)]
 fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let mut pos = 0usize;
     while pos < buf.len() {
@@ -572,7 +574,7 @@ fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (LinkPairs, Vec<(u64, u6
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::new();
-            for_records::<2>(buf, |[a, bb]| {
+            scan::for_records::<2>(buf, |[a, bb]| {
                 if a.is_empty() || bb.is_empty() {
                     return;
                 }
@@ -648,7 +650,7 @@ fn parse_events(
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut buckets: Vec<Vec<Ev>> = (0..NB).map(|_| Vec::with_capacity(buf.len() / 70 / NB + 8)).collect();
-            for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
+            scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
                 }
@@ -708,7 +710,7 @@ fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, ca
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::with_capacity(buf.len() / 45 + 16);
-            for_records::<4>(buf, |[cid, uid, cmp, ts]| {
+            scan::for_records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
