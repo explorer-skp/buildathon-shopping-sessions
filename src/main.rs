@@ -1608,6 +1608,22 @@ fn main() {
     )
     .unwrap();
     log!("done {:?}", t0.elapsed());
+    // Drop the input page mappings from all workers: exit would otherwise
+    // walk every page table entry of 1.9 GB of mapped files on one thread.
+    #[cfg(unix)]
+    {
+        let maps: Vec<(usize, usize)> = ev_maps
+            .iter()
+            .chain(cl_maps.iter())
+            .chain(ln_maps.iter())
+            .flatten()
+            .map(|m| (m.as_ptr() as usize, m.len()))
+            .collect();
+        maps.par_iter().for_each(|&(p, n)| unsafe {
+            libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+        });
+        log!("released inputs {:?}", t0.elapsed());
+    }
     // skip destructors of large structures
     std::process::exit(0);
 }
