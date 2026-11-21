@@ -15,7 +15,8 @@ jobs:
         run: docker build --platform linux/amd64 -t entry .
       - name: Build the previous commit's image
         run: |
-          git worktree add -q ../prev HEAD~1
+          P=HEAD~1; [ -f bench_prev.txt ] && P=$(cat bench_prev.txt)
+          git worktree add -q ../prev $P
           docker build --platform linux/amd64 -t prev ../prev
       - name: Make a 20M-event dataset
         run: |
