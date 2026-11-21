@@ -494,6 +494,21 @@ impl LinkTable {
             i = (i + 1) & self.mask;
         }
     }
+    /// First stage of a two-stage prefetch: the filter word only.
+    #[inline(always)]
+    fn prefetch_filter(&self, k: u64) {
+        let (w, _) = self.fbit(Self::fix(k));
+        prefetch(self.filt.as_ptr().wrapping_add(w));
+    }
+    /// Second stage: the slot, only when the filter says the key may be present.
+    #[inline(always)]
+    fn prefetch_slot(&self, k: u64) {
+        let k = Self::fix(k);
+        let (w, m) = self.fbit(k);
+        if self.filt[w] & m != 0 {
+            prefetch(self.slots.as_ptr().wrapping_add((k as usize) & self.mask));
+        }
+    }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
         let k = Self::fix(k);
@@ -1065,8 +1080,11 @@ fn main() {
             let per = v.len() / NP;
             let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 4)).collect();
             for i in 0..v.len() {
-                if i + 8 < v.len() {
-                    link.prefetch(v[i + 8].pk);
+                if i + 64 < v.len() {
+                    link.prefetch_filter(v[i + 64].pk);
+                }
+                if i + 32 < v.len() {
+                    link.prefetch_slot(v[i + 32].pk);
                 }
                 let mut c = v[i];
                 if let Some(x) = link.get(c.pk) {
@@ -1081,6 +1099,7 @@ fn main() {
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- kept events: resolve persons, route to person partitions
+    let pf_old = std::env::var_os("SS_PF1").is_some();
     let rgroups = (ncpu * 8).clamp(1, ev_recs.len().clamp(1, 255));
     let per_r = ev_recs.len().div_ceil(rgroups).max(1);
     let (dd, purchases): (Vec<Vec<Vec<EvP>>>, Vec<Vec<(u32, u16)>>) = (0..rgroups)
@@ -1095,8 +1114,17 @@ fn main() {
                 let recs = &ev_recs[c];
                 let lw = &losers[c];
                 for i in 0..recs.len() {
-                    if i + 16 < recs.len() {
-                        link.prefetch(recs[i + 16].uh);
+                    if pf_old {
+                        if i + 16 < recs.len() {
+                            link.prefetch(recs[i + 16].uh);
+                        }
+                    } else {
+                        if i + 64 < recs.len() {
+                            link.prefetch_filter(recs[i + 64].uh);
+                        }
+                        if i + 32 < recs.len() {
+                            link.prefetch_slot(recs[i + 32].uh);
+                        }
                     }
                     let r = &recs[i];
                     if !r.keep || (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {

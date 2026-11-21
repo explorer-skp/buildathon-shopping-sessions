@@ -32,7 +32,7 @@ jobs:
             e=$(date +%s.%N)
             echo "$2: $(echo "$e - $s" | bc) s"
           }
-          for i in 1 2 3; do run "-e SS_NB=256" "A"; run "" "B"; done
+          for i in 1 2 3; do run "-e SS_PF1=1" "A"; run "" "B"; done
           for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
