@@ -706,13 +706,15 @@ fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
 /// Joins every link line into people and returns the table from an ID hash
 /// to (person key, person name). The person key is the hash of the person's
 /// byte-wise smallest ID, and the name points at that ID's bytes.
-type LinkPairs = Vec<Vec<(u64, u64, u64, u64)>>;
+/// One link line: both ID hashes and both ID byte refs.
+type LinkPair = (u64, u64, u64, u64);
 
-/// Parallel part of linking: parse link lines and list every distinct ID.
-fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (LinkPairs, Vec<(u64, u64)>) {
-    let ln_parsed: Vec<Vec<(u64, u64, u64, u64)>> = chunks
+/// Parallel part of linking: parse link lines, and sort every line end by its
+/// ID hash, keeping where it came from (2 * line + side).
+fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (Vec<LinkPair>, Vec<(u64, u32)>) {
+    let pairs: Vec<LinkPair> = chunks
         .par_iter()
-        .map(|c| {
+        .flat_map_iter(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
             let mut v = Vec::new();
@@ -725,24 +727,26 @@ fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (LinkPairs, Vec<(u64, u6
             v
         })
         .collect();
-    let mut ids: Vec<(u64, u64)> = ln_parsed
-        .par_iter()
-        .flat_map_iter(|v| v.iter().flat_map(|&(ha, hb, ra, rb)| [(ha, ra), (hb, rb)]))
-        .collect();
-    ids.par_sort_unstable_by_key(|x| x.0);
-    ids.dedup_by_key(|x| x.0);
-    (ln_parsed, ids)
+    let mut ends: Vec<(u64, u32)> =
+        (0..pairs.len()).into_par_iter().flat_map_iter(|i| [(pairs[i].0, 2 * i as u32), (pairs[i].1, 2 * i as u32 + 1)]).collect();
+    ends.par_sort_unstable_by_key(|x| x.0);
+    (pairs, ends)
 }
 
-/// Sequential part of linking: union-find and the final lookup table. Runs on
-/// its own thread while the pool parses events and clicks.
-fn link_table(ln_parsed: LinkPairs, ids: Vec<(u64, u64)>) -> LinkTable {
-    let n_ids = ids.len();
-    let mut dense = LinkTable::new(n_ids);
-    for (i, x) in ids.iter().enumerate() {
-        dense.insert(x.0, i as u64, 0);
+/// Sequential part of linking: dense IDs from the sorted line ends, union-find,
+/// and the final lookup table. Runs on its own thread while the pool parses.
+fn link_table(pairs: Vec<LinkPair>, ends: Vec<(u64, u32)>) -> LinkTable {
+    // dense index of each line end, and (hash, name ref) of each distinct ID
+    let mut dense_of = vec![0u32; ends.len()];
+    let mut ids: Vec<(u64, u64)> = Vec::with_capacity(ends.len() / 2 + 1);
+    for (j, &(h, slot)) in ends.iter().enumerate() {
+        if j == 0 || ends[j - 1].0 != h {
+            let p = &pairs[(slot / 2) as usize];
+            ids.push((h, if slot % 2 == 0 { p.2 } else { p.3 }));
+        }
+        dense_of[slot as usize] = (ids.len() - 1) as u32;
     }
-    let dense_of = |h: u64| -> u32 { dense.get(h).unwrap() as u32 };
+    let n_ids = ids.len();
     let mut parent: Vec<u32> = (0..n_ids as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -752,21 +756,18 @@ fn link_table(ln_parsed: LinkPairs, ids: Vec<(u64, u64)>) -> LinkTable {
         }
         x
     }
-    for v in &ln_parsed {
-        for &(a, b, _, _) in v {
-            let ra = find(&mut parent, dense_of(a));
-            let rb = find(&mut parent, dense_of(b));
-            if ra != rb {
-                // the root keeps the byte-wise smaller name, so roots name people
-                if unpack(ids[ra as usize].1) <= unpack(ids[rb as usize].1) {
-                    parent[rb as usize] = ra;
-                } else {
-                    parent[ra as usize] = rb;
-                }
+    for i in 0..pairs.len() {
+        let ra = find(&mut parent, dense_of[2 * i]);
+        let rb = find(&mut parent, dense_of[2 * i + 1]);
+        if ra != rb {
+            // the root keeps the byte-wise smaller name, so roots name people
+            if unpack(ids[ra as usize].1) <= unpack(ids[rb as usize].1) {
+                parent[rb as usize] = ra;
+            } else {
+                parent[ra as usize] = rb;
             }
         }
     }
-    drop(dense);
     let mut link = LinkTable::new(n_ids);
     for i in 0..n_ids as u32 {
         let r = find(&mut parent, i) as usize;
@@ -976,10 +977,10 @@ fn main() {
     let ln_chunks = chunks(&ln_maps, 1 << 20);
 
     // ---------------- links on one worker, overlapped with parsing events and clicks
-    let (ln_parsed, ids) = link_ids(&ln_maps, &ln_chunks);
+    let (ln_pairs, ln_ends) = link_ids(&ln_maps, &ln_chunks);
     log!("link ids {:?}", t0.elapsed());
     // the union-find runs on its own thread while the pool parses events and clicks together
-    let link_thread = std::thread::spawn(move || link_table(ln_parsed, ids));
+    let link_thread = std::thread::spawn(move || link_table(ln_pairs, ln_ends));
     let (parsed, cl_raw) = rayon::join(
         || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb),
         || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp),
