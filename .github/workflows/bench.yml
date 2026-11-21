@@ -13,6 +13,10 @@ jobs:
           cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
       - name: Build image
         run: docker build --platform linux/amd64 -t entry .
+      - name: Build the previous commit's image
+        run: |
+          git worktree add -q ../prev HEAD~1
+          docker build --platform linux/amd64 -t prev ../prev
       - name: Make a 20M-event dataset
         run: |
           curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
@@ -28,11 +32,11 @@ jobs:
             sudo rm -rf out && mkdir out && chmod 777 out
             s=$(date +%s.%N)
             docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
-              -e NCPU=$(nproc) -e MEM_GB=12 $1 -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch entry
+              -e NCPU=$(nproc) -e MEM_GB=12 -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch $1
             e=$(date +%s.%N)
             echo "$2: $(echo "$e - $s" | bc) s"
           }
-          for i in 1 2 3; do run "-e SS_OLDSORT=1" "A"; run "" "B"; done
+          for i in 1 2 3 4; do run prev "A(prev)"; run entry "B"; done
           for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12

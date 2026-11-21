@@ -459,8 +459,11 @@ struct LinkTable {
 }
 
 impl LinkTable {
+    fn cap_for(n: usize) -> usize {
+        ((n * 8 / 5).max(16)).next_power_of_two()
+    }
     fn new(n: usize) -> Self {
-        let cap = ((n * 8 / 5).max(16)).next_power_of_two();
+        let cap = Self::cap_for(n);
         let fbits = (n * 24).max(64).next_power_of_two();
         LinkTable {
             n: 0,
@@ -521,15 +524,42 @@ impl LinkTable {
             i = (i + 1) & self.mask;
         }
     }
-    /// The person key of an ID, if the ID appears in a link line.
+    /// Like `get` without the filter, for lookups grouped by table slice,
+    /// where the slots are already in cache.
     #[inline]
-    fn get(&self, k: u64) -> Option<u64> {
-        self.slot(k).map(|i| self.slots[i].1)
+    fn get_direct(&self, k: u64) -> Option<u64> {
+        let k = Self::fix(k);
+        let mut i = (k as usize) & self.mask;
+        loop {
+            let s = &self.slots[i];
+            if s.0 == k {
+                return Some(s.1);
+            }
+            if s.0 == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
     }
     /// The name of a person given its key, if the person has links.
     #[inline]
     fn name(&self, pk: u64) -> Option<u64> {
         self.slot(pk).map(|i| self.names[i])
+    }
+}
+
+/// Which slice of the link table an ID hash probes first. Records are grouped
+/// by slice while parsing, so person lookups later walk one slice at a time
+/// and find its slots in cache instead of in memory.
+#[derive(Clone, Copy)]
+struct Lb {
+    mask: usize,
+    shift: u32,
+}
+impl Lb {
+    #[inline(always)]
+    fn of(self, k: u64) -> usize {
+        ((LinkTable::fix(k) as usize) & self.mask) >> self.shift
     }
 }
 
@@ -697,7 +727,7 @@ type LinkPair = (u64, u64, u64, u64);
 
 /// Parallel part of linking: parse link lines, and sort every line end by its
 /// ID hash, keeping where it came from (2 * line + side).
-fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (Vec<LinkPair>, Vec<(u64, u32)>) {
+fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (Vec<LinkPair>, Vec<(u64, u32)>, usize) {
     let pairs: Vec<LinkPair> = chunks
         .par_iter()
         .flat_map_iter(|c| {
@@ -716,7 +746,8 @@ fn link_ids(maps: &[Option<Mmap>], chunks: &[Chunk]) -> (Vec<LinkPair>, Vec<(u64
     let mut ends: Vec<(u64, u32)> =
         (0..pairs.len()).into_par_iter().flat_map_iter(|i| [(pairs[i].0, 2 * i as u32), (pairs[i].1, 2 * i as u32 + 1)]).collect();
     ends.par_sort_unstable_by_key(|x| x.0);
-    (pairs, ends)
+    let n_ids = if ends.is_empty() { 0 } else { ends.par_windows(2).filter(|w| w[0].0 != w[1].0).count() + 1 };
+    (pairs, ends, n_ids)
 }
 
 /// Sequential part of linking: dense IDs from the sorted line ends, union-find,
@@ -773,13 +804,15 @@ fn parse_events(
     prod: &StrMap<u16>,
     unknown_cat: u16,
     nb: usize,
-) -> Vec<(Vec<Rec>, Vec<Vec<Key>>, Vec<(u32, u16)>)> {
+    lb: Lb,
+    nlb: usize,
+) -> Vec<(Vec<Vec<Rec>>, Vec<Vec<Key>>, Vec<(u32, u16)>)> {
     chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            let mut recs: Vec<Rec> = Vec::with_capacity(buf.len() / 70 + 16);
+            let mut recs: Vec<Vec<Rec>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 70 / nlb + 16)).collect();
             let mut purch: Vec<(u32, u16)> = Vec::new();
             let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
@@ -826,15 +859,22 @@ fn parse_events(
                 }
                 // the late rule needs only this copy's own times
                 let keep = ok && ingest - (tsv as i64 + ws) <= DAY;
-                let (uh, uref) = if keep { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
-                let rix = recs.len() as u32;
-                let pur = if keep && pr > 0 {
-                    purch.push((pr, cat));
-                    purch.len() as u32
+                // only a copy that would count is stored; others need just a dedup key
+                let rix = if keep {
+                    let uh = xxh3_64(uid);
+                    let pur = if pr > 0 {
+                        purch.push((pr, cat));
+                        purch.len() as u32
+                    } else {
+                        0
+                    };
+                    let b = lb.of(uh);
+                    let pos = recs[b].len() as u32;
+                    recs[b].push(Rec { uh, uref: pack(uid), ts: tsv, pur });
+                    ((b as u32) << 24) | pos
                 } else {
-                    0
+                    u32::MAX
                 };
-                recs.push(Rec { uh, uref, ts: tsv, pur });
                 buckets[(h >> 64) as usize & (nb - 1)].push(Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
             });
             (recs, buckets, purch)
@@ -844,13 +884,21 @@ fn parse_events(
 
 /// Parses every click file into one vector per chunk. `pk` holds the user
 /// hash until the link table resolves it to the person.
-fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, camp: &StrMap<u32>) -> Vec<Vec<ClP>> {
+fn parse_clicks(
+    maps: &[Option<Mmap>],
+    chunks: &[Chunk],
+    cbase: i64,
+    we: i64,
+    camp: &StrMap<u32>,
+    lb: Lb,
+    nlb: usize,
+) -> Vec<Vec<Vec<ClP>>> {
     chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            let mut v = Vec::with_capacity(buf.len() / 45 + 16);
+            let mut v: Vec<Vec<ClP>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 45 / nlb + 16)).collect();
             scan::for_records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
@@ -860,7 +908,8 @@ fn parse_clicks(maps: &[Option<Mmap>], chunks: &[Chunk], cbase: i64, we: i64, ca
                     return;
                 }
                 let Some(ci) = camp.get(cmp) else { return };
-                v.push(ClP { pk: xxh3_64(uid), cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
+                let uh = xxh3_64(uid);
+                v[lb.of(uh)].push(ClP { pk: uh, cid: pack(cid), ts: (t - cbase) as u32, camp: ci });
             });
             v
         })
@@ -970,16 +1019,21 @@ fn main() {
     let ln_chunks = chunks(&ln_maps, 1 << 20);
 
     // ---------------- links on one worker, overlapped with parsing events and clicks
-    let (ln_pairs, ln_ends) = link_ids(&ln_maps, &ln_chunks);
+    let (ln_pairs, ln_ends, n_ids) = link_ids(&ln_maps, &ln_chunks);
+    // slices of 32k slots (512 KB), at most 256 of them
+    let lcap = LinkTable::cap_for(n_ids);
+    let lbits = (lcap.trailing_zeros() as i32 - 15).clamp(0, 8) as u32;
+    let nlb = 1usize << lbits;
+    let lb = Lb { mask: lcap - 1, shift: lcap.trailing_zeros() - lbits };
     log!("link ids {:?}", t0.elapsed());
     // the union-find runs on its own thread while the pool parses events and clicks together
     let link_thread = std::thread::spawn(move || link_table(ln_pairs, ln_ends));
     let (parsed, cl_raw) = rayon::join(
-        || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb),
-        || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp),
+        || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb, lb, nlb),
+        || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp, lb, nlb),
     );
     log!("parsed events and clicks {:?}", t0.elapsed());
-    let mut ev_recs: Vec<Vec<Rec>> = Vec::with_capacity(parsed.len());
+    let mut ev_recs: Vec<Vec<Vec<Rec>>> = Vec::with_capacity(parsed.len());
     let mut ev_keys: Vec<Vec<Vec<Key>>> = Vec::with_capacity(parsed.len());
     let mut ev_purch: Vec<Vec<(u32, u16)>> = Vec::with_capacity(parsed.len());
     for (r, k, pu) in parsed {
@@ -990,8 +1044,10 @@ fn main() {
 
     // ---------------- dedup on event_id: mark each copy that is not the kept one.
     // It needs no person data, so it runs while the union-find may still be going.
-    let losers: Vec<Vec<AtomicU64>> =
-        ev_recs.iter().map(|r| (0..r.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect();
+    let losers: Vec<Vec<Vec<AtomicU64>>> = ev_recs
+        .iter()
+        .map(|rb| rb.iter().map(|r| (0..r.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect())
+        .collect();
     let groups = (ncpu * 8).clamp(1, nb);
     let per_g = nb.div_ceil(groups);
     {
@@ -1000,8 +1056,12 @@ fn main() {
         (0..groups).into_par_iter().for_each(|g| {
             let lo_b = g * per_g;
             let hi_b = ((g + 1) * per_g).min(nb);
+            // a copy without a record would not count anyway
             let mark = |c: usize, rix: u32| {
-                losers[c][(rix / 64) as usize].fetch_or(1u64 << (rix % 64), Ordering::Relaxed);
+                if rix != u32::MAX {
+                    let pos = rix & 0xFF_FFFF;
+                    losers[c][(rix >> 24) as usize][(pos / 64) as usize].fetch_or(1u64 << (pos % 64), Ordering::Relaxed);
+                }
             };
             // Open-addressing table, 8 bytes a slot: fingerprint << 32 | stamp, where
             // stamp = stamp0 + index + 1 and the index counts the bucket's copies in
@@ -1074,21 +1134,21 @@ fn main() {
     let link = &link;
     log!("linked {} ids {:?}", link.n, t0.elapsed());
 
-    // ---------------- clicks: resolve persons, route to person partitions
-    let cl_parts: Vec<Vec<Vec<ClP>>> = cl_raw
-        .par_iter()
-        .map(|v| {
-            let per = v.len() / NP;
+    // ---------------- clicks: resolve persons one table slice at a time, route to person partitions
+    let cl_parts: Vec<Vec<Vec<ClP>>> = (0..nlb)
+        .into_par_iter()
+        .map(|b| {
+            let n: usize = cl_raw.iter().map(|v| v[b].len()).sum();
+            let per = n / NP;
             let mut parts: Vec<Vec<ClP>> = (0..NP).map(|_| Vec::with_capacity(per + per / 4 + 4)).collect();
-            for i in 0..v.len() {
-                if i + 8 < v.len() {
-                    link.prefetch(v[i + 8].pk);
+            for v in cl_raw.iter() {
+                for &c in v[b].iter() {
+                    let mut c = c;
+                    if let Some(x) = link.get_direct(c.pk) {
+                        c.pk = x;
+                    }
+                    parts[part_of(c.pk)].push(c);
                 }
-                let mut c = v[i];
-                if let Some(x) = link.get(c.pk) {
-                    c.pk = x;
-                }
-                parts[part_of(c.pk)].push(c);
             }
             parts
         })
@@ -1096,32 +1156,24 @@ fn main() {
     std::mem::forget(cl_raw);
     log!("routed clicks {:?}", t0.elapsed());
 
-    // ---------------- kept events: resolve persons, route to person partitions
-    let rgroups = (ncpu * 8).clamp(1, ev_recs.len().clamp(1, 255));
-    let per_r = ev_recs.len().div_ceil(rgroups).max(1);
-    let (dd, purchases): (Vec<Vec<Vec<EvP>>>, Vec<Vec<(u32, u16)>>) = (0..rgroups)
+    // ---------------- kept events: resolve persons one table slice at a time, route to person partitions
+    let (dd, purchases): (Vec<Vec<Vec<EvP>>>, Vec<Vec<(u32, u16)>>) = (0..nlb)
         .into_par_iter()
-        .map(|g| {
+        .map(|b| {
             let mut purch: Vec<(u32, u16)> = Vec::new();
-            let lo = (g * per_r).min(ev_recs.len());
-            let hi = ((g + 1) * per_r).min(ev_recs.len());
-            let n_est: usize = ev_recs[lo..hi].iter().map(|r| r.len()).sum();
+            let n_est: usize = ev_recs.iter().map(|r| r[b].len()).sum();
             let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
-            for c in lo..hi {
-                let recs = &ev_recs[c];
-                let lw = &losers[c];
-                for i in 0..recs.len() {
-                    if i + 16 < recs.len() {
-                        link.prefetch(recs[i + 16].uh);
-                    }
-                    let r = &recs[i];
-                    if r.uref == 0 || (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
+            for c in 0..ev_recs.len() {
+                let recs = &ev_recs[c][b];
+                let lw = &losers[c][b];
+                for (i, r) in recs.iter().enumerate() {
+                    if (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
                         continue;
                     }
-                    let pk = link.get(r.uh).unwrap_or(r.uh);
+                    let pk = link.get_direct(r.uh).unwrap_or(r.uh);
                     let aux = if r.pur != 0 {
                         purch.push(ev_purch[c][(r.pur - 1) as usize]);
-                        ((g as u32) << 24) | purch.len() as u32
+                        ((b as u32) << 24) | purch.len() as u32
                     } else {
                         0
                     };
