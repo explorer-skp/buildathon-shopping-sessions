@@ -157,19 +157,6 @@ fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N
     }
 }
 
-/// Hint the CPU to pull a cache line in ahead of use.
-#[inline(always)]
-fn prefetch<T>(p: *const T) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags));
-    }
-}
-
 /// Splits one line into exactly N fields under the rules' dialect.
 /// Returns None for a malformed line. Quotes around a whole field are
 /// stripped; any other quote makes the line malformed.
@@ -445,17 +432,13 @@ fn unpack<'a>(r: u64) -> &'a [u8] {
 // ------------------------------------------------------------------ link table
 
 /// Open-addressing table from an ID hash to its person key, 16 bytes a slot so
-/// a slot never spans two cache lines. Person names sit in a side array read
-/// once per person. A one-bit-per-key filter answers most lookups of IDs that
-/// have no link without touching the table. Keys are xxh3 hashes, so the low
-/// bits index slots and the high bits index the filter. Key 0 marks empty.
+/// a slot never spans two cache lines, with person names in a side array.
+/// Keys are hashes, so the low bits index slots. Key 0 marks empty.
 struct LinkTable {
     n: usize,
     mask: usize,
     slots: Vec<(u64, u64)>,
     names: Vec<u64>,
-    filt: Vec<u64>,
-    fshift: u32,
 }
 
 impl LinkTable {
@@ -464,29 +447,14 @@ impl LinkTable {
     }
     fn new(n: usize) -> Self {
         let cap = Self::cap_for(n);
-        let fbits = (n * 24).max(64).next_power_of_two();
-        LinkTable {
-            n: 0,
-            mask: cap - 1,
-            slots: vec![(0, 0); cap],
-            names: vec![0; cap],
-            filt: vec![0; fbits / 64],
-            fshift: 64 - fbits.trailing_zeros(),
-        }
+        LinkTable { n: 0, mask: cap - 1, slots: vec![(0, 0); cap], names: vec![0; cap] }
     }
     #[inline(always)]
     fn fix(k: u64) -> u64 {
         if k == 0 { 0x9e37_79b9_7f4a_7c15 } else { k }
     }
-    #[inline(always)]
-    fn fbit(&self, k: u64) -> (usize, u64) {
-        let b = (k >> self.fshift) as usize;
-        (b >> 6, 1u64 << (b & 63))
-    }
     fn insert(&mut self, k: u64, pk: u64, nref: u64) {
         let k = Self::fix(k);
-        let (w, m) = self.fbit(k);
-        self.filt[w] |= m;
         let mut i = (k as usize) & self.mask;
         loop {
             let s = &mut self.slots[i];
@@ -498,20 +466,11 @@ impl LinkTable {
             i = (i + 1) & self.mask;
         }
     }
-    #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        let k = Self::fix(k);
-        let (w, _) = self.fbit(k);
-        prefetch(self.filt.as_ptr().wrapping_add(w));
-        prefetch(self.slots.as_ptr().wrapping_add((k as usize) & self.mask));
-    }
+    /// The slot of an ID, probed one table slice at a time by the callers, so
+    /// the slots are already in cache.
     #[inline]
-    fn slot(&self, k: u64) -> Option<usize> {
+    fn slot_direct(&self, k: u64) -> Option<usize> {
         let k = Self::fix(k);
-        let (w, m) = self.fbit(k);
-        if self.filt[w] & m == 0 {
-            return None;
-        }
         let mut i = (k as usize) & self.mask;
         loop {
             let s = &self.slots[i];
@@ -524,27 +483,9 @@ impl LinkTable {
             i = (i + 1) & self.mask;
         }
     }
-    /// Like `get` without the filter, for lookups grouped by table slice,
-    /// where the slots are already in cache.
     #[inline]
     fn get_direct(&self, k: u64) -> Option<u64> {
-        let k = Self::fix(k);
-        let mut i = (k as usize) & self.mask;
-        loop {
-            let s = &self.slots[i];
-            if s.0 == k {
-                return Some(s.1);
-            }
-            if s.0 == 0 {
-                return None;
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-    /// The name of a person given its key, if the person has links.
-    #[inline]
-    fn name(&self, pk: u64) -> Option<u64> {
-        self.slot(pk).map(|i| self.names[i])
+        self.slot_direct(k).map(|i| self.slots[i].1)
     }
 }
 
@@ -1188,14 +1129,18 @@ fn main() {
                     if (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
                         continue;
                     }
-                    let pk = link.get_direct(r.uh).unwrap_or(r.uh);
+                    // linked people carry their name (smallest ID), others their own ID
+                    let (pk, nref) = match link.slot_direct(r.uh) {
+                        Some(si) => (link.slots[si].1, link.names[si]),
+                        None => (r.uh, r.uref),
+                    };
                     let aux = if r.pur != 0 {
                         purch.push(ev_purch[c][(r.pur - 1) as usize]);
                         ((b as u32) << 24) | purch.len() as u32
                     } else {
                         0
                     };
-                    parts[part_of(pk)].push(EvP { pk, nref: r.uref, ts: r.ts, aux });
+                    parts[part_of(pk)].push(EvP { pk, nref, ts: r.ts, aux });
                 }
             }
             (parts, purch)
@@ -1295,14 +1240,10 @@ fn main() {
                 let mut i = 0usize;
                 while i < evs.len() {
                     let person = evs[i].pk;
-                    // linked people are named by their smallest ID, others by their own ID
-                    let name = link.name(person).unwrap_or(evs[i].nref);
+                    let name = evs[i].nref;
                     let mut j = i + 1;
                     while j < evs.len() && evs[j].pk == person {
                         j += 1;
-                    }
-                    if j < evs.len() {
-                        link.prefetch(evs[j].pk);
                     }
                     while ci < cls.len() && cls[ci].pk < person {
                         ci += 1;
