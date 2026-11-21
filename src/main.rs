@@ -557,6 +557,10 @@ struct ClP {
     camp: u32,
 }
 
+/// Timing experiments only (wrong output): 1 = scan only, 2 = no record or
+/// key writes, 3 = no timestamp parsing, 4 = no hashing.
+static PMODE: std::sync::LazyLock<u8> =
+    std::sync::LazyLock::new(|| std::env::var("SS_PMODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
 const PB: u32 = 10; // person partitions = 1 << PB (by person key)
 const NP: usize = 1 << PB;
 
@@ -815,14 +819,19 @@ fn parse_events(
             bump::select(0);
             let mut rswc: swc::Swc<Rec> = swc::Swc::new(nlb);
             let mut kswc: swc::Swc<Key> = swc::Swc::new(nb);
+            let pmode = *PMODE;
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
+                if pmode == 1 {
+                    std::hint::black_box((eid.len(), uid.len(), ts.len(), ing.len(), typ.len(), pid.len(), price.len()));
+                    return;
+                }
                 if eid.is_empty() {
                     return;
                 }
-                let h = xxh3_128(eid);
-                let ingest = crate::ts::parse_ts(ing).unwrap_or(i64::MAX);
+                let h = if pmode == 4 { eid.len() as u128 * 0x9e37_79b9_7f4a_7c15 } else { xxh3_128(eid) };
+                let ingest = if pmode == 3 { ws + ing.len() as i64 } else { crate::ts::parse_ts(ing).unwrap_or(i64::MAX) };
                 let mut ok = !uid.is_empty() && !pid.is_empty();
-                let tsv = match crate::ts::parse_ts(ts) {
+                let tsv = match if pmode == 3 { Some(ws + ts.len() as i64) } else { crate::ts::parse_ts(ts) } {
                     Some(t) if t >= ws && t < we => (t - ws) as u32,
                     _ => {
                         ok = false;
@@ -861,7 +870,7 @@ fn parse_events(
                 let keep = ok && ingest - (tsv as i64 + ws) <= DAY;
                 // only a copy that would count is stored; others need just a dedup key
                 let rix = if keep {
-                    let uh = xxh3_64(uid);
+                    let uh = if pmode == 4 { uid.len() as u64 * 0x9e37_79b9_7f4a_7c15 } else { xxh3_64(uid) };
                     let b = lb.of(uh);
                     if pr > 0 {
                         purch[b].push((pr, cat));
@@ -874,7 +883,11 @@ fn parse_events(
                     };
                     let w = off | len << 24 | ((pr > 0) as u64) << 31 | (tsv as u64) << 32;
                     let pos = (recs[b].len() + rswc.pending(b)) as u64;
-                    rswc.push(&mut recs, b, Rec { uh, w });
+                    if pmode == 2 {
+                        std::hint::black_box((uh, w));
+                    } else {
+                        rswc.push(&mut recs, b, Rec { uh, w });
+                    }
                     let rix = ((b as u64) << pbits) | pos;
                     if pos >= (1 << pbits) - 1 || rix >= NOREC {
                         POS_OVERFLOW.store(true, Ordering::Relaxed);
@@ -884,7 +897,11 @@ fn parse_events(
                     NOREC
                 };
                 let ing40 = if ingest == i64::MAX { (1u64 << 40) - 1 } else { (ingest - (ws - (1i64 << 39))).clamp(0, (1i64 << 40) - 2) as u64 };
-                kswc.push(&mut buckets, (h >> 64) as usize & (nb - 1), Key { e0: h as u64, w: (ing40 << 24) | rix });
+                if pmode == 2 {
+                    std::hint::black_box((h, ing40, rix));
+                } else {
+                    kswc.push(&mut buckets, (h >> 64) as usize & (nb - 1), Key { e0: h as u64, w: (ing40 << 24) | rix });
+                }
             });
             rswc.finish(&mut recs);
             kswc.finish(&mut buckets);
