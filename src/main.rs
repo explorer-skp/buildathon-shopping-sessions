@@ -442,30 +442,52 @@ fn unpack<'a>(r: u64) -> &'a [u8] {
 
 // ------------------------------------------------------------------ link table
 
-/// Open-addressing table from an ID hash to (person key, person name ref).
-/// Keys are xxh3 hashes, so the low bits index directly. Key 0 marks empty.
+/// Open-addressing table from an ID hash to its person key, 16 bytes a slot so
+/// a slot never spans two cache lines. Person names sit in a side array read
+/// once per person. A one-bit-per-key filter answers most lookups of IDs that
+/// have no link without touching the table. Keys are xxh3 hashes, so the low
+/// bits index slots and the high bits index the filter. Key 0 marks empty.
 struct LinkTable {
     n: usize,
     mask: usize,
-    slots: Vec<(u64, u64, u64)>,
+    slots: Vec<(u64, u64)>,
+    names: Vec<u64>,
+    filt: Vec<u64>,
+    fshift: u32,
 }
 
 impl LinkTable {
     fn new(n: usize) -> Self {
         let cap = ((n * 8 / 5).max(16)).next_power_of_two();
-        LinkTable { n: 0, mask: cap - 1, slots: vec![(0, 0, 0); cap] }
+        let fbits = (n * 24).max(64).next_power_of_two();
+        LinkTable {
+            n: 0,
+            mask: cap - 1,
+            slots: vec![(0, 0); cap],
+            names: vec![0; cap],
+            filt: vec![0; fbits / 64],
+            fshift: 64 - fbits.trailing_zeros(),
+        }
     }
-    #[inline]
+    #[inline(always)]
     fn fix(k: u64) -> u64 {
         if k == 0 { 0x9e37_79b9_7f4a_7c15 } else { k }
     }
+    #[inline(always)]
+    fn fbit(&self, k: u64) -> (usize, u64) {
+        let b = (k >> self.fshift) as usize;
+        (b >> 6, 1u64 << (b & 63))
+    }
     fn insert(&mut self, k: u64, pk: u64, nref: u64) {
         let k = Self::fix(k);
+        let (w, m) = self.fbit(k);
+        self.filt[w] |= m;
         let mut i = (k as usize) & self.mask;
         loop {
             let s = &mut self.slots[i];
             if s.0 == 0 || s.0 == k {
-                *s = (k, pk, nref);
+                *s = (k, pk);
+                self.names[i] = nref;
                 return;
             }
             i = (i + 1) & self.mask;
@@ -473,23 +495,39 @@ impl LinkTable {
     }
     #[inline(always)]
     fn prefetch(&self, k: u64) {
-        let i = (Self::fix(k) as usize) & self.mask;
-        prefetch(self.slots.as_ptr().wrapping_add(i));
+        let k = Self::fix(k);
+        let (w, _) = self.fbit(k);
+        prefetch(self.filt.as_ptr().wrapping_add(w));
+        prefetch(self.slots.as_ptr().wrapping_add((k as usize) & self.mask));
     }
     #[inline]
-    fn get(&self, k: u64) -> Option<(u64, u64)> {
+    fn slot(&self, k: u64) -> Option<usize> {
         let k = Self::fix(k);
+        let (w, m) = self.fbit(k);
+        if self.filt[w] & m == 0 {
+            return None;
+        }
         let mut i = (k as usize) & self.mask;
         loop {
             let s = &self.slots[i];
             if s.0 == k {
-                return Some((s.1, s.2));
+                return Some(i);
             }
             if s.0 == 0 {
                 return None;
             }
             i = (i + 1) & self.mask;
         }
+    }
+    /// The person key of an ID, if the ID appears in a link line.
+    #[inline]
+    fn get(&self, k: u64) -> Option<u64> {
+        self.slot(k).map(|i| self.slots[i].1)
+    }
+    /// The name of a person given its key, if the person has links.
+    #[inline]
+    fn name(&self, pk: u64) -> Option<u64> {
+        self.slot(pk).map(|i| self.names[i])
     }
 }
 
@@ -680,7 +718,7 @@ fn link_table(ln_parsed: LinkPairs, ids: Vec<(u64, u64)>) -> LinkTable {
     for (i, x) in ids.iter().enumerate() {
         dense.insert(x.0, i as u64, 0);
     }
-    let dense_of = |h: u64| -> u32 { dense.get(h).unwrap().0 as u32 };
+    let dense_of = |h: u64| -> u32 { dense.get(h).unwrap() as u32 };
     let mut parent: Vec<u32> = (0..n_ids as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -931,7 +969,7 @@ fn main() {
                 }
                 let mut c = v[i];
                 if let Some(x) = link.get(c.pk) {
-                    c.pk = x.0;
+                    c.pk = x;
                 }
                 parts[part_of(c.pk)].push(c);
             }
@@ -1035,8 +1073,8 @@ fn main() {
                         link.prefetch(unsafe { (*kept[i + 16]).uh });
                     }
                     let e = unsafe { &*kept[i] };
-                    let (pk, nref) = link.get(e.uh).unwrap_or((e.uh, e.uref));
-                    parts[part_of(pk)].push(EvP { pk, nref, ts: e.ts, price: e.price, cat: e.cat });
+                    let pk = link.get(e.uh).unwrap_or(e.uh);
+                    parts[part_of(pk)].push(EvP { pk, nref: e.uref, ts: e.ts, price: e.price, cat: e.cat });
                 }
             }
             parts
@@ -1122,7 +1160,8 @@ fn main() {
                 let mut i = 0usize;
                 while i < evs.len() {
                     let person = evs[i].pk;
-                    let name = evs[i].nref;
+                    // linked people are named by their smallest ID, others by their own ID
+                    let name = link.name(person).unwrap_or(evs[i].nref);
                     let mut j = i + 1;
                     while j < evs.len() && evs[j].pk == person {
                         j += 1;
