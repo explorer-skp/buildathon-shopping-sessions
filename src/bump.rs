@@ -20,6 +20,16 @@ const HUGE: usize = 2 << 20;
 
 thread_local! {
     static TL: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static LOCAL_OFF: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sends this thread's allocations to the system allocator until `local_on`.
+pub fn local_off() {
+    LOCAL_OFF.with(|c| c.set(true));
+}
+
+pub fn local_on() {
+    LOCAL_OFF.with(|c| c.set(false));
 }
 
 /// Maps the region. Call once at the start of main, before other threads run.
@@ -61,7 +71,7 @@ pub fn stop() {
 
 #[inline(always)]
 fn on() -> bool {
-    BASE.load(Ordering::Relaxed) != 0 && ON.load(Ordering::Relaxed)
+    BASE.load(Ordering::Relaxed) != 0 && ON.load(Ordering::Relaxed) && !LOCAL_OFF.with(|c| c.get())
 }
 
 #[inline(always)]

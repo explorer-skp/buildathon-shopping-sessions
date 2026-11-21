@@ -1151,6 +1151,12 @@ fn main() {
     let n_kept: usize = dd.iter().map(|g| g.iter().map(|v| v.len()).sum::<usize>()).sum();
     let sb = ((n_kept / NP / 8).max(1).ilog2()).clamp(4, 16);
     let cat_rank = &cat_rank;
+    let ud = out.join("user_daily");
+    let cd = out.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let ud = &ud;
+    let cat_ref = &cat_names;
     let camp_accs: Vec<std::sync::Mutex<Vec<[u64; 4]>>> =
         (0..rayon::current_num_threads().max(1)).map(|_| std::sync::Mutex::new(Vec::new())).collect();
     let camp_accs = &camp_accs;
@@ -1382,6 +1388,24 @@ fn main() {
                     ci = cj;
                 }
             }
+            if !rows.is_empty() {
+                // write this task's file now, so encoding overlaps other tasks; the
+                // writer frees and reallocates buffers, so it uses the system allocator
+                drop(acc_guard);
+                bump::local_off();
+                pq::write_user_daily(
+                    &ud.join(format!("part-{t:05}.parquet")),
+                    rows.len(),
+                    |r| unpack(rows[r].0),
+                    |r| rows[r].1,
+                    |r| rows[r].2 as i64,
+                    |r| rows[r].3 as i64,
+                    |r| rows[r].4 as i64,
+                    |r| if rows[r].5 < 0 { None } else { Some(&cat_ref[rows[r].5 as usize][..]) },
+                )
+                .unwrap();
+                bump::local_on();
+            }
             Part { user_rows: rows }
         })
         .collect();
@@ -1405,30 +1429,9 @@ fn main() {
 
     // ---------------- write outputs (the writer frees and reallocates buffers, so use the system allocator)
     bump::stop();
-    let ud = out.join("user_daily");
-    let cd = out.join("campaign_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    std::fs::create_dir_all(&cd).unwrap();
-
-    let cat_ref = &cat_names;
-    let all_empty = parts.iter().all(|p| p.user_rows.is_empty());
-    parts.par_iter().enumerate().for_each(|(pi, p)| {
-        if p.user_rows.is_empty() && !(all_empty && pi == 0) {
-            return;
-        }
-        let rows = &p.user_rows;
-        pq::write_user_daily(
-            &ud.join(format!("part-{pi:05}.parquet")),
-            rows.len(),
-            |r| unpack(rows[r].0),
-            |r| rows[r].1,
-            |r| rows[r].2 as i64,
-            |r| rows[r].3 as i64,
-            |r| rows[r].4 as i64,
-            |r| if rows[r].5 < 0 { None } else { Some(&cat_ref[rows[r].5 as usize][..]) },
-        )
-        .unwrap();
-    });
+    if parts.iter().all(|p| p.user_rows.is_empty()) {
+        pq::write_user_daily(&ud.join("part-00000.parquet"), 0, |_| &[][..], |_| 0, |_| 0, |_| 0, |_| 0, |_| None).unwrap();
+    }
     let mut crows: Vec<(usize, usize)> = vec![];
     for c in 0..ncamp {
         for d in 0..ndays {
