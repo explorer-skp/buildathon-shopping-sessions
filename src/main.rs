@@ -512,21 +512,31 @@ impl Lb {
 /// the kept copy and `uref != 0`.
 #[derive(Clone, Copy)]
 struct Rec {
-    uh: u64,   // user_id hash
-    uref: u64, // user_id bytes
-    ts: u32,   // ms since window start
-    pur: u32,  // 0, or index + 1 into the chunk's purchases (price, category)
+    uh: u64, // user_id hash
+    // user_id offset in its chunk (24 bits; for long IDs, an index into the
+    // chunk's long-ID list) | length (7 bits, 127 = long) << 24 | purchase
+    // flag << 31 | ts (ms since window start) << 32. A purchase's (price,
+    // category) is the next entry of the chunk's per-slice purchase list.
+    w: u64,
 }
 
-/// The dedup key of one copy: 96 bits of the event_id hash, the copy's
-/// ingest time, and its index among its chunk's records.
+/// The dedup key of one copy, 16 bytes: 64 bits of the event_id hash (its
+/// bucket fixes more bits), and `w` = ingest offset (40 bits, ms from
+/// window_start - 2^39) << 24 | record position (24 bits: slice << pbits | pos,
+/// all ones for a copy that has no record). Generator ingest times lie within
+/// days of the window, far inside the 40-bit range; an unparseable ingest
+/// takes the top value, so it sorts after every real one.
 #[derive(Clone, Copy)]
 struct Key {
     e0: u64,
-    ingest: i64,
-    e1: u32,
-    rix: u32,
+    w: u64,
 }
+
+const NOREC: u64 = 0xFF_FFFF;
+
+/// Set when a record position does not fit its bits; main then reruns
+/// itself with smaller chunks.
+static POS_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A surviving event, routed to its person's partition.
 #[derive(Clone, Copy)]
@@ -785,7 +795,8 @@ fn parse_events(
     nb: usize,
     lb: Lb,
     nlb: usize,
-) -> Vec<(Vec<Vec<Rec>>, Vec<Vec<Key>>, Vec<(u32, u16)>)> {
+    pbits: u32,
+) -> Vec<(Vec<Vec<Rec>>, Vec<Vec<Key>>, Vec<Vec<(u32, u16)>>, Vec<u64>)> {
     chunks
         .par_iter()
         .map(|c| {
@@ -795,7 +806,9 @@ fn parse_events(
             bump::select(2);
             let mut recs: Vec<Vec<Rec>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 70 / nlb + 16)).collect();
             bump::select(0);
-            let mut purch: Vec<(u32, u16)> = Vec::new();
+            let mut purch: Vec<Vec<(u32, u16)>> = (0..nlb).map(|_| Vec::new()).collect();
+            let mut long_ids: Vec<u64> = Vec::new();
+            let cbase = buf.as_ptr() as usize;
             // dedup keys die after dedup, so they live in the scratch region
             bump::select(1);
             let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
@@ -849,24 +862,33 @@ fn parse_events(
                 // only a copy that would count is stored; others need just a dedup key
                 let rix = if keep {
                     let uh = xxh3_64(uid);
-                    let pur = if pr > 0 {
-                        purch.push((pr, cat));
-                        purch.len() as u32
-                    } else {
-                        0
-                    };
                     let b = lb.of(uh);
-                    let pos = (recs[b].len() + rswc.pending(b)) as u32;
-                    rswc.push(&mut recs, b, Rec { uh, uref: pack(uid), ts: tsv, pur });
-                    ((b as u32) << 24) | pos
+                    if pr > 0 {
+                        purch[b].push((pr, cat));
+                    }
+                    let (off, len) = if uid.len() < 127 {
+                        ((uid.as_ptr() as usize - cbase) as u64, uid.len() as u64)
+                    } else {
+                        long_ids.push(pack(uid));
+                        ((long_ids.len() - 1) as u64, 127)
+                    };
+                    let w = off | len << 24 | ((pr > 0) as u64) << 31 | (tsv as u64) << 32;
+                    let pos = (recs[b].len() + rswc.pending(b)) as u64;
+                    rswc.push(&mut recs, b, Rec { uh, w });
+                    let rix = ((b as u64) << pbits) | pos;
+                    if pos >= (1 << pbits) - 1 || rix >= NOREC {
+                        POS_OVERFLOW.store(true, Ordering::Relaxed);
+                    }
+                    rix & NOREC
                 } else {
-                    u32::MAX
+                    NOREC
                 };
-                kswc.push(&mut buckets, (h >> 64) as usize & (nb - 1), Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
+                let ing40 = if ingest == i64::MAX { (1u64 << 40) - 1 } else { (ingest - (ws - (1i64 << 39))).clamp(0, (1i64 << 40) - 2) as u64 };
+                kswc.push(&mut buckets, (h >> 64) as usize & (nb - 1), Key { e0: h as u64, w: (ing40 << 24) | rix });
             });
             rswc.finish(&mut recs);
             kswc.finish(&mut buckets);
-            (recs, buckets, purch)
+            (recs, buckets, purch, long_ids)
         })
         .collect()
 }
@@ -949,7 +971,12 @@ fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| v.is_power_of_two())
         .unwrap_or_else(|| (ev_bytes / 76 / 40_000).next_power_of_two().clamp(256, 4096));
-    let ev_chunks = chunks(&ev_maps, (4usize << 20) * nb / 512);
+    // event chunks stay under 16 MB so record name offsets fit 24 bits
+    let chunk_div: usize = std::env::var("SS_CHUNKDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let ev_chunks = chunks(&ev_maps, ((4usize << 20) * nb / 512).min((16 << 20) - (1 << 16)) / chunk_div);
+    let ev_chunks_base: Vec<usize> =
+        ev_chunks.iter().map(|c| ev_maps[c.file].as_ref().map_or(0, |m| m.as_ptr() as usize + c.start)).collect();
+    let ev_chunks_base = &ev_chunks_base;
     let cl_chunks = chunks(&cl_maps, 4 << 20);
 
 
@@ -1027,18 +1054,32 @@ fn main() {
     let lbits = (lcap.trailing_zeros() as i32 - 15).clamp(0, 8) as u32;
     let nlb = 1usize << lbits;
     let lb = Lb { mask: lcap - 1, shift: lcap.trailing_zeros() - lbits };
+    let pbits = 24 - lbits;
     log!("link ids {:?}", t0.elapsed());
     // the union-find runs on its own thread while the pool parses events and clicks together
     let link_thread = std::thread::spawn(move || link_table(ln_pairs, ln_ends));
     let (parsed, cl_raw) = rayon::join(
-        || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb, lb, nlb),
+        || parse_events(&ev_maps, &ev_chunks, ws, we, &prod, unknown_cat, nb, lb, nlb, pbits),
         || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp, lb, nlb),
     );
     log!("parsed events and clicks {:?}", t0.elapsed());
+    if chunk_div == 1 && std::env::var_os("SS_TEST_OVERFLOW").is_some() {
+        POS_OVERFLOW.store(true, Ordering::Relaxed);
+    }
+    if POS_OVERFLOW.load(Ordering::Relaxed) {
+        assert!(chunk_div < 64, "record positions overflow even with small chunks");
+        // a slice of one chunk held too many records for the key's position
+        // bits: run again with chunks a quarter the size
+        let div = chunk_div * 4;
+        let st = std::process::Command::new(std::env::current_exe().expect("exe")).env("SS_CHUNKDIV", div.to_string()).status().expect("rerun");
+        std::process::exit(st.code().unwrap_or(1));
+    }
     let mut ev_recs: Vec<Vec<Vec<Rec>>> = Vec::with_capacity(parsed.len());
     let mut ev_keys: Vec<Vec<Vec<Key>>> = Vec::with_capacity(parsed.len());
-    let mut ev_purch: Vec<Vec<(u32, u16)>> = Vec::with_capacity(parsed.len());
-    for (r, k, pu) in parsed {
+    let mut ev_purch: Vec<Vec<Vec<(u32, u16)>>> = Vec::with_capacity(parsed.len());
+    let mut ev_long: Vec<Vec<u64>> = Vec::with_capacity(parsed.len());
+    for (r, k, pu, lg) in parsed {
+        ev_long.push(lg);
         ev_recs.push(r);
         ev_keys.push(k);
         ev_purch.push(pu);
@@ -1059,10 +1100,11 @@ fn main() {
             let lo_b = g * per_g;
             let hi_b = ((g + 1) * per_g).min(nb);
             // a copy without a record would not count anyway
-            let mark = |c: usize, rix: u32| {
-                if rix != u32::MAX {
-                    let pos = rix & 0xFF_FFFF;
-                    losers[c][(rix >> 24) as usize][(pos / 64) as usize].fetch_or(1u64 << (pos % 64), Ordering::Relaxed);
+            let mark = |c: usize, w: u64| {
+                let rix = w & NOREC;
+                if rix != NOREC {
+                    let pos = rix & ((1 << pbits) - 1);
+                    losers[c][(rix >> pbits) as usize][(pos / 64) as usize].fetch_or(1u64 << (pos % 64), Ordering::Relaxed);
                 }
             };
             // Open-addressing table, 8 bytes a slot: fingerprint << 32 | stamp, where
@@ -1110,12 +1152,12 @@ fn main() {
                             }
                             if v >> 32 == fp {
                                 let (w, wc) = at((st - stamp0 - 1) as u32);
-                                if w.e0 == k.e0 && w.e1 == k.e1 {
-                                    if k.ingest < w.ingest {
+                                if w.e0 == k.e0 {
+                                    if (k.w >> 24) < (w.w >> 24) {
                                         table[s] = (fp << 32) | me;
-                                        mark(wc, w.rix);
+                                        mark(wc, w.w);
                                     } else {
-                                        mark(c, k.rix);
+                                        mark(c, k.w);
                                     }
                                     break;
                                 }
@@ -1180,22 +1222,41 @@ fn main() {
             for c in 0..ev_recs.len() {
                 let recs = &ev_recs[c][b];
                 let lw = &losers[c][b];
+                let cp = &ev_purch[c][b];
+                let cbase = ev_chunks_base[c];
+                let mut pi = 0usize;
                 for (i, r) in recs.iter().enumerate() {
+                    let has_pur = (r.w >> 31) & 1 != 0;
+                    let p = if has_pur {
+                        pi += 1;
+                        cp[pi - 1]
+                    } else {
+                        (0, 0)
+                    };
                     if (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
                         continue;
                     }
                     // linked people carry their name (smallest ID), others their own ID
                     let (pk, nref) = match link.slot_direct(r.uh) {
                         Some(si) => (link.slots[si].1, link.names[si]),
-                        None => (r.uh, r.uref),
+                        None => {
+                            let off = (r.w & 0xFF_FFFF) as usize;
+                            let len = ((r.w >> 24) & 127) as usize;
+                            let nref = if len < 127 {
+                                pack(unsafe { std::slice::from_raw_parts((cbase + off) as *const u8, len) })
+                            } else {
+                                ev_long[c][off]
+                            };
+                            (r.uh, nref)
+                        }
                     };
-                    let aux = if r.pur != 0 {
-                        purch.push(ev_purch[c][(r.pur - 1) as usize]);
+                    let aux = if has_pur {
+                        purch.push(p);
                         ((b as u32) << 24) | purch.len() as u32
                     } else {
                         0
                     };
-                    swc.push(&mut parts, part_of(pk), EvP { pk, nref, ts: r.ts, aux });
+                    swc.push(&mut parts, part_of(pk), EvP { pk, nref, ts: (r.w >> 32) as u32, aux });
                 }
             }
             swc.finish(&mut parts);
