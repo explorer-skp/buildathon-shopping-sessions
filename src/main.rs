@@ -561,8 +561,8 @@ struct EvP {
     pk: u64,
     nref: u64,
     ts: u32,
-    price: u32,
-    cat: u16,
+    // 0, or for a purchase: routing group << 24 | (index + 1) into that group's purchases
+    aux: u32,
 }
 
 /// A valid click, routed to its person's partition.
@@ -951,7 +951,11 @@ fn main() {
     // dedup buckets of about 40k copies keep each bucket's table in L2; chunks
     // grow with the bucket count so each chunk still fills its buckets
     let ev_bytes: usize = ev_maps.iter().map(|m| m.as_ref().map_or(0, |m| m.len())).sum();
-    let nb = (ev_bytes / 76 / 40_000).next_power_of_two().clamp(256, 4096);
+    let nb = std::env::var("SS_NB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| v.is_power_of_two())
+        .unwrap_or_else(|| (ev_bytes / 76 / 40_000).next_power_of_two().clamp(256, 4096));
     let ev_chunks = chunks(&ev_maps, (4usize << 20) * nb / 512);
     let cl_chunks = chunks(&cl_maps, 4 << 20);
     let ln_chunks = chunks(&ln_maps, 1 << 20);
@@ -1077,11 +1081,12 @@ fn main() {
     log!("routed clicks {:?}", t0.elapsed());
 
     // ---------------- kept events: resolve persons, route to person partitions
-    let rgroups = (ncpu * 8).clamp(1, ev_recs.len().max(1));
+    let rgroups = (ncpu * 8).clamp(1, ev_recs.len().clamp(1, 255));
     let per_r = ev_recs.len().div_ceil(rgroups).max(1);
-    let dd: Vec<Vec<Vec<EvP>>> = (0..rgroups)
+    let (dd, purchases): (Vec<Vec<Vec<EvP>>>, Vec<Vec<(u32, u16)>>) = (0..rgroups)
         .into_par_iter()
         .map(|g| {
+            let mut purch: Vec<(u32, u16)> = Vec::new();
             let lo = (g * per_r).min(ev_recs.len());
             let hi = ((g + 1) * per_r).min(ev_recs.len());
             let n_est: usize = ev_recs[lo..hi].iter().map(|r| r.len()).sum();
@@ -1098,12 +1103,19 @@ fn main() {
                         continue;
                     }
                     let pk = link.get(r.uh).unwrap_or(r.uh);
-                    parts[part_of(pk)].push(EvP { pk, nref: r.uref, ts: r.ts, price: r.price, cat: r.cat });
+                    let aux = if r.price > 0 {
+                        purch.push((r.price, r.cat));
+                        ((g as u32) << 24) | purch.len() as u32
+                    } else {
+                        0
+                    };
+                    parts[part_of(pk)].push(EvP { pk, nref: r.uref, ts: r.ts, aux });
                 }
             }
-            parts
+            (parts, purch)
         })
-        .collect();
+        .unzip();
+    let purchases = &purchases;
     std::mem::forget(ev_recs);
     log!("routed events {:?}", t0.elapsed());
 
@@ -1190,6 +1202,9 @@ fn main() {
                     while j < evs.len() && evs[j].pk == person {
                         j += 1;
                     }
+                    if j < evs.len() {
+                        link.prefetch(evs[j].pk);
+                    }
                     while ci < cls.len() && cls[ci].pk < person {
                         ci += 1;
                     }
@@ -1262,11 +1277,13 @@ fn main() {
                             }
                             last = tt;
                             n_ev += 1;
-                            let price = evs[m].price as u64;
-                            if price > 0 {
+                            let aux = evs[m].aux;
+                            if aux != 0 {
+                                let (pr, ct) = purchases[(aux >> 24) as usize][((aux & 0xFF_FFFF) - 1) as usize];
+                                let price = pr as u64;
                                 rev += price;
                                 purch = true;
-                                catrev[evs[m].cat as usize] += price;
+                                catrev[ct as usize] += price;
                             }
                             m += 1;
                         }
