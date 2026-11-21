@@ -582,6 +582,17 @@ impl<V: Copy> StrMap<V> {
     }
 }
 
+/// Sorts a group by a key of at most 96 bits (high bits first) plus the
+/// row index, using the primitive sort on u128 keys, then permutes the rows.
+fn keyed_sort<T: Copy>(g: &mut [T], key: impl Fn(&T) -> u128, keys: &mut Vec<u128>, tmp: &mut Vec<T>) {
+    keys.clear();
+    keys.extend(g.iter().enumerate().map(|(i, x)| (key(x) << 32) | i as u128));
+    keys.sort_unstable();
+    tmp.clear();
+    tmp.extend(keys.iter().map(|&k| g[(k as u32) as usize]));
+    g.copy_from_slice(tmp);
+}
+
 /// Gathers the slices into `out` in the order of `less`, which must order by
 /// the person key first. A counting pass on the `sb` key bits right below the
 /// partition bits splits the rows into small groups, then each group gets an
@@ -591,7 +602,8 @@ fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     sb: u32,
     key: impl Fn(&T) -> u64,
     less: impl Fn(&T, &T) -> bool,
-    by_rest: impl Fn(&mut [T]),
+    mut by_rest: impl FnMut(&mut [T]),
+    mut many: impl FnMut(&mut [T]),
     cnt: &mut [u32],
     out: &mut Vec<T>,
 ) -> usize {
@@ -642,15 +654,7 @@ fn group_sort<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
                 // one person, often a heavy one: sort on the rest of the key
                 by_rest(g);
             } else {
-                g.sort_unstable_by(|a, b| {
-                    if less(a, b) {
-                        std::cmp::Ordering::Less
-                    } else if less(b, a) {
-                        std::cmp::Ordering::Greater
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                });
+                many(g);
             }
         }
         lo = hi;
@@ -1195,6 +1199,8 @@ fn main() {
             let mut cls: Vec<ClP> = Vec::new();
             let mut byc: Vec<(u32, i64)> = Vec::new();
             let mut cnt: Vec<u32> = vec![0; (1 << sb) + 1];
+            let (mut skeys, mut skeys2) = (Vec::new(), Vec::new());
+            let (mut stmp, mut stmp2): (Vec<EvP>, Vec<EvP>) = (Vec::new(), Vec::new());
             for p in t * per_t..((t + 1) * per_t).min(NP) {
                 if old_sort {
                     evs.clear();
@@ -1218,7 +1224,8 @@ fn main() {
                         sb,
                         |e: &EvP| e.pk,
                         |a: &EvP, b: &EvP| (a.pk, a.ts) < (b.pk, b.ts),
-                        |g: &mut [EvP]| g.sort_unstable_by_key(|e| e.ts),
+                        |g: &mut [EvP]| keyed_sort(g, |e| e.ts as u128, &mut skeys, &mut stmp),
+                        |g: &mut [EvP]| keyed_sort(g, |e| ((e.pk as u128) << 32) | e.ts as u128, &mut skeys2, &mut stmp2),
                         &mut cnt,
                         &mut evs,
                     );
@@ -1234,6 +1241,11 @@ fn main() {
                                 == std::cmp::Ordering::Less
                         },
                         |g: &mut [ClP]| g.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))),
+                        |g: &mut [ClP]| {
+                            g.sort_unstable_by(|a, b| {
+                                (a.pk, a.ts).cmp(&(b.pk, b.ts)).then_with(|| unpack(a.cid).cmp(unpack(b.cid)))
+                            })
+                        },
                         &mut cnt,
                         &mut cls,
                     );
