@@ -40,10 +40,15 @@ jobs:
           }
           for i in 1 2 3 4; do run prev "A(prev)"; run entry "B"; done
           # parse-phase cost split: each mode once with phase logs
-          for t in 1 2 4 1 2 4; do
+          for t in 1 4 1 4 1 4; do for m in block line; do
             sudo rm -rf out && mkdir out && chmod 777 out
-            docker run --rm --network none --user 1000:1000 -e NCPU=$t -e SS_LOG=1 -e SS_PMODE=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry 2>&1 | grep -E "tables and link|parsed events and clicks" | tr '\n' ' ' | sed "s/^/scan only, $t threads: /"; echo
-          done
+            docker run --rm --network none --user 1000:1000 -e NCPU=$t -e SS_LOG=1 -e SS_PMODE=1 -e SS_SCAN=$m -v $PWD/data:/data:ro -v $PWD/out:/output entry 2>&1 | grep -E "parsed events and clicks" | tr '\n' ' ' | sed "s/^/scan only, $m, $t threads: /"; echo
+          done; done
+          # full pipeline, parse phase and total, both scanners
+          for i in 1 2 3; do for m in block line; do
+            sudo rm -rf out && mkdir out && chmod 777 out
+            docker run --rm --network none --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -e SS_SCAN=$m -v $PWD/data:/data:ro -v $PWD/out:/output entry 2>&1 | grep -E "parsed events and clicks|^done" | tr '\n' ' ' | sed "s/^/full, $m: /"; echo
+          done; done
           # optional switch A/B on the new image, set in bench_ab.txt as: label env-args
           if [ -f bench_ab.txt ] && [ "$(cat bench_ab.txt)" != none ]; then read -r LAB ARGS < bench_ab.txt; for i in 1 2 3; do run entry "C($LAB)" $ARGS; run entry "B2"; done; fi
           for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
@@ -71,3 +76,6 @@ jobs:
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -v $PWD/data:/data:ro -v $PWD/out-new:/output entry
           pip install -q polars
           python3 tools/pqdiff.py out-ref out-new
+          sudo rm -rf out-line && mkdir out-line && chmod 777 out-line
+          docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_SCAN=line -v $PWD/data:/data:ro -v $PWD/out-line:/output entry
+          python3 tools/pqdiff.py out-ref out-line

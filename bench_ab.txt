@@ -1,1 +1,1 @@
-none
+line -e SS_SCAN=line

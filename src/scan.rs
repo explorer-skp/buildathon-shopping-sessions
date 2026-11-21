@@ -191,6 +191,108 @@ pub fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8
     }
 }
 
+/// Comma, quote and newline masks of the 128 bytes at `p`.
+#[inline(always)]
+fn masks128(p: *const u8) -> (u128, u128, u128) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = [
+            _mm256_loadu_si256(p as *const __m256i),
+            _mm256_loadu_si256(p.add(32) as *const __m256i),
+            _mm256_loadu_si256(p.add(64) as *const __m256i),
+            _mm256_loadu_si256(p.add(96) as *const __m256i),
+        ];
+        let mm = |ch: u8| -> u128 {
+            let k = _mm256_set1_epi8(ch as i8);
+            let m = |x: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, k)) as u32 as u64;
+            let lo = m(v[0]) | m(v[1]) << 32;
+            let hi = m(v[2]) | m(v[3]) << 32;
+            lo as u128 | (hi as u128) << 64
+        };
+        (mm(b','), mm(b'"'), mm(b'\n'))
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        let (c0, q0, n0) = masks(p);
+        let (c1, q1, n1) = masks(unsafe { p.add(64) });
+        (c0 as u128 | (c1 as u128) << 64, q0 as u128 | (q1 as u128) << 64, n0 as u128 | (n1 as u128) << 64)
+    }
+}
+
+#[inline(always)]
+fn prefix_xor128(x: u128) -> u128 {
+    let lo = prefix_xor(x as u64);
+    let hi = prefix_xor((x >> 64) as u64) ^ ((lo as i64 >> 63) as u64);
+    lo as u128 | (hi as u128) << 64
+}
+
+/// Picks the scanner: the line scanner with SS_SCAN=line, else the block one.
+pub static LINES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("SS_SCAN").map_or(false, |v| v == "line"));
+
+#[inline(always)]
+pub fn records<'a, const N: usize>(buf: &'a [u8], f: impl FnMut([&'a [u8]; N])) {
+    if *LINES {
+        for_records_lines::<N>(buf, f)
+    } else {
+        for_records::<N>(buf, f)
+    }
+}
+
+/// Same output as `for_records`, a line at a time. The masks of the 128
+/// bytes from a line start hold its newline and every comma, so a line takes
+/// a fixed run of work with no loop over delimiters and no branch on where
+/// the block edges fall. The parity of quotes is 0 at every line start (the
+/// block scanner restarts it after a newline inside quotes), so the quote
+/// rules apply to the line alone. Lines of 128 bytes or more, and the last
+/// 128 bytes of the buffer, go through the block scanner.
+#[inline(always)]
+pub fn for_records_lines<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
+    let len = buf.len();
+    let base = buf.as_ptr();
+    let mut out: [&'a [u8]; N] = [&[]; N];
+    let mut ls = 0usize;
+    while ls + 128 <= len {
+        let (c, q, n) = masks128(unsafe { base.add(ls) });
+        if n == 0 {
+            let e = memchr::memchr(b'\n', &buf[ls..]).map_or(len, |i| ls + i + 1);
+            for_records::<N>(&buf[ls..e], &mut f);
+            ls = e;
+            continue;
+        }
+        let nlp = n.trailing_zeros();
+        let below = (1u128 << nlp) - 1;
+        let cm = c & below;
+        let qm = q & below;
+        let mut ok = cm.count_ones() == (N - 1) as u32;
+        if qm != 0 {
+            let d = cm | (1u128 << nlp);
+            let px = prefix_xor128(qm);
+            let bad = (d & px) | (qm & px & !((d << 1) | 1)) | (qm & !px & !(d >> 1));
+            ok &= bad == 0;
+        }
+        if ok {
+            let p = unsafe { base.add(ls) };
+            let mut m = cm;
+            let mut fs = 0u32;
+            for slot in out.iter_mut().take(N - 1) {
+                let e = m.trailing_zeros();
+                m &= m - 1;
+                let w = (unsafe { *p.add(fs as usize) } == b'"') as u32;
+                *slot = unsafe { std::slice::from_raw_parts(p.add((fs + w) as usize), (e - fs).saturating_sub(2 * w) as usize) };
+                fs = e + 1;
+            }
+            let w = (unsafe { *p.add(fs as usize) } == b'"') as u32;
+            out[N - 1] = unsafe { std::slice::from_raw_parts(p.add((fs + w) as usize), (nlp - fs).saturating_sub(2 * w) as usize) };
+            f(out);
+        }
+        ls += nlp as usize + 1;
+    }
+    if ls < len {
+        for_records::<N>(&buf[ls..], f);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +305,9 @@ mod tests {
                 let mut got = vec![];
                 for_records::<$n>(buf, |x| got.push(x));
                 assert_eq!(want, got, "N={} buf={:?}", $n, String::from_utf8_lossy(buf));
+                let mut got2 = vec![];
+                for_records_lines::<$n>(buf, |x| got2.push(x));
+                assert_eq!(want, got2, "lines N={} buf={:?}", $n, String::from_utf8_lossy(buf));
             }};
         }
         cmp!(2);
@@ -265,5 +370,51 @@ mod tests {
             }
             same(&v);
         }
+        // lines of 0 to 12 fields and 0 to 200 bytes, some quoted, some broken
+        let mut fast = 0usize;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut v = Vec::new();
+            let lines = (x % 40) as usize;
+            for _ in 0..lines {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let nf = (x % 13) as usize;
+                for k in 0..nf {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    if k > 0 {
+                        v.push(b',');
+                    }
+                    let fl = (x >> 8) % 30;
+                    let quoted = (x >> 16) % 5 == 0;
+                    if quoted {
+                        v.push(b'"');
+                    }
+                    for j in 0..fl {
+                        v.push(b"abcxyz019"[((x >> (20 + j % 40)) % 9) as usize]);
+                    }
+                    if quoted && (x >> 30) % 50 != 0 {
+                        v.push(b'"');
+                    }
+                    match (x >> 40) % 200 {
+                        0 => v.push(b'"'),
+                        1 => v.push(b'\r'),
+                        _ => {}
+                    }
+                }
+                v.push(b'\n');
+            }
+            if (x >> 50) % 4 == 0 {
+                v.extend_from_slice(b"ab,\"c\",d");
+            }
+            fast += v.len().saturating_sub(128);
+            same(&v);
+        }
+        assert!(fast > 10_000_000, "{fast}");
     }
 }

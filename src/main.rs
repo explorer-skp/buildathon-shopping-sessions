@@ -825,7 +825,7 @@ fn parse_events(
             let mut rswc: swc::Swc<Rec> = swc::Swc::new(nlb);
             let mut kswc: swc::Swc<Key> = swc::Swc::new(nb);
             let pmode = *PMODE;
-            scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
+            scan::records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if pmode == 1 {
                     std::hint::black_box((eid.len(), uid.len(), ts.len(), ing.len(), typ.len(), pid.len(), price.len()));
                     return;
@@ -939,7 +939,7 @@ fn parse_clicks(
             let mut v: Vec<Vec<ClP>> = (0..nlb).map(|_| Vec::with_capacity(buf.len() / 45 / nlb + 16)).collect();
             bump::select(0);
             let mut cswc: swc::Swc<ClP> = swc::Swc::new(nlb);
-            scan::for_records::<4>(buf, |[cid, uid, cmp, ts]| {
+            scan::records::<4>(buf, |[cid, uid, cmp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
                     return;
                 }
