@@ -1,13 +1,7 @@
 name: final60
 on:
-  workflow_dispatch:
-    inputs:
-      a:
-        description: first commit
-        required: true
-      b:
-        description: second commit
-        required: true
+  push:
+    branches: [final60]
 jobs:
   ab60:
     runs-on: ubuntu-latest
@@ -17,8 +11,10 @@ jobs:
           fetch-depth: 0
       - name: Build both images
         run: |
-          git worktree add -q ../a ${{ inputs.a }} && docker build -q --platform linux/amd64 -t a ../a
-          git worktree add -q ../b ${{ inputs.b }} && docker build -q --platform linux/amd64 -t b ../b
+          read -r A B < final60.txt
+          echo "a=$A b=$B"
+          git worktree add -q ../a $A && docker build -q --platform linux/amd64 -t a ../a
+          git worktree add -q ../b $B && docker build -q --platform linux/amd64 -t b ../b
       - name: Make a 60M-event dataset
         run: |
           curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
