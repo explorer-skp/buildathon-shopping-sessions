@@ -38,3 +38,7 @@ jobs:
           S=$(dirname $(find kit -name compare.py | head -1))
           A=$(dirname $(find kit -name user_daily.csv -path '*answer*' | head -1))
           (cd $S && python3 compare.py $GITHUB_WORKSPACE/out $GITHUB_WORKSPACE/$A)
+      - name: Unit tests on x86 (scanner, timestamps and hashes against references)
+        run: |
+          F=$(find $GITHUB_WORKSPACE/kit -type d -name fixtures | head -1)
+          SS_TEST_DEV=$GITHUB_WORKSPACE/dev SS_TEST_FIXTURES=$F RUSTFLAGS="-C target-cpu=x86-64-v3" cargo test --release 2>&1 | grep -E "test result|panicked|FAILED|error" ; test ${PIPESTATUS[0]} -eq 0

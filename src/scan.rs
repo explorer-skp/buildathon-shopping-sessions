@@ -213,8 +213,9 @@ mod tests {
     #[test]
     fn matches_scalar_scanner() {
         let mut files = 0;
-        for d in ["../data/dev/events", "../data/dev/clicks", "../data/dev/links"] {
-            for e in std::fs::read_dir(d).unwrap().flatten() {
+        let dev = crate::test_dir("SS_TEST_DEV", "../data/dev");
+        for d in ["events", "clicks", "links"] {
+            for e in std::fs::read_dir(dev.join(d)).unwrap().flatten() {
                 let b = std::fs::read(e.path()).unwrap();
                 same(&b);
                 // odd sub-slices: chunk edges in the middle of lines and blocks
@@ -227,7 +228,7 @@ mod tests {
             }
         }
         assert!(files > 3);
-        for d in ["../kit/starter-duckdb/starter-duckdb/fixtures"] {
+        for d in [crate::test_dir("SS_TEST_FIXTURES", "../kit/starter-duckdb/starter-duckdb/fixtures")] {
             fn walk(p: &std::path::Path, n: &mut usize) {
                 for e in std::fs::read_dir(p).unwrap().flatten() {
                     let q = e.path();
@@ -240,7 +241,7 @@ mod tests {
                 }
             }
             let mut n = 0;
-            walk(std::path::Path::new(d), &mut n);
+            walk(&d, &mut n);
             assert!(n > 30, "{n} fixture files");
         }
         // random bytes over the characters that matter

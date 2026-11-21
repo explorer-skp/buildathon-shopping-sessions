@@ -61,32 +61,74 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     if n != 20 && n != 25 {
         return crate::parse_ts(b);
     }
-    let w0 = ld8(b, 0); // YYYY-MM-
-    let w1 = ld8(b, 8); // DDTHH:MM
-    let w2 = ld8(b, 12); // H:MM:SS?
-    if (w0 & 0xFF00_00FF_0000_0000) != 0x2D00_002D_0000_0000
-        || (w1 & 0x0000_FF00_00FF_0000) != 0x0000_3A00_0054_0000
-        || (w2 >> 32) & 0xFF != 0x3A
-    {
-        return crate::parse_ts(b);
-    }
-    let v0 = (w0 & !0xFF00_00FF_0000_0000) | 0x3000_0030_0000_0000;
-    let v1 = (w1 & !0x0000_FF00_00FF_0000) | 0x0000_3000_0030_0000;
-    let v2 = (w2 & 0x00FF_FF00_0000_0000) | 0x3000_0030_3030_3030;
-    if !(all_digits(v0) & all_digits(v1) & all_digits(v2)) {
-        return None;
-    }
-    let x0 = v0 - 0x3030_3030_3030_3030;
-    let x1 = v1 - 0x3030_3030_3030_3030;
-    let x2 = v2 - 0x3030_3030_3030_3030;
-    let t0 = x0 * 10 + (x0 >> 8);
-    let t1 = x1 * 10 + (x1 >> 8);
-    let y = ((t0 & 0xFF) * 100 + ((t0 >> 16) & 0xFF)) as i64;
-    let mo = ((t0 >> 40) & 0xFF) as i64;
-    let d = (t1 & 0xFF) as i64;
-    let h = ((t1 >> 24) & 0xFF) as i64;
-    let mi = ((t1 >> 48) & 0xFF) as i64;
-    let s = (((x2 >> 40) & 0xFF) * 10 + ((x2 >> 48) & 0xFF)) as i64;
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    let (y, mo, d, h, mi, s) = {
+        // one 16-byte load checks "YYYY-MM-DDTHH:MM" and turns its digit pairs into numbers
+        use std::arch::x86_64::*;
+        let (seq, dig, p) = unsafe {
+            let v = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+            let sep = _mm_setr_epi8(0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0);
+            let seq = _mm_movemask_epi8(_mm_cmpeq_epi8(v, sep)) as u32;
+            let dv = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+            let nine = _mm_set1_epi8(9);
+            let dig = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_max_epu8(dv, nine), nine)) as u32;
+            let g = _mm_shuffle_epi8(dv, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+            let p = _mm_maddubs_epi16(g, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+            (seq, dig, p)
+        };
+        // separators at 4, 7, 10, 13 (and 16 below); otherwise only F3 can apply
+        if seq & 0x2490 != 0x2490 {
+            return crate::parse_ts(b);
+        }
+        // with any of those separators present, F3 fails too, so the answer is None
+        if b[16] != b':' || dig & 0xDB6F != 0xDB6F {
+            return None;
+        }
+        let s = crate::d2(b, 17)?;
+        let lane = |i: i32| -> i64 {
+            (unsafe {
+                match i {
+                    0 => _mm_extract_epi16(p, 0),
+                    1 => _mm_extract_epi16(p, 1),
+                    2 => _mm_extract_epi16(p, 2),
+                    3 => _mm_extract_epi16(p, 3),
+                    4 => _mm_extract_epi16(p, 4),
+                    _ => _mm_extract_epi16(p, 5),
+                }
+            }) as i64
+        };
+        (lane(0) * 100 + lane(1), lane(2), lane(3), lane(4), lane(5), s)
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+    let (y, mo, d, h, mi, s) = {
+        let w0 = ld8(b, 0); // YYYY-MM-
+        let w1 = ld8(b, 8); // DDTHH:MM
+        let w2 = ld8(b, 12); // H:MM:SS?
+        if (w0 & 0xFF00_00FF_0000_0000) != 0x2D00_002D_0000_0000
+            || (w1 & 0x0000_FF00_00FF_0000) != 0x0000_3A00_0054_0000
+            || (w2 >> 32) & 0xFF != 0x3A
+        {
+            return crate::parse_ts(b);
+        }
+        let v0 = (w0 & !0xFF00_00FF_0000_0000) | 0x3000_0030_0000_0000;
+        let v1 = (w1 & !0x0000_FF00_00FF_0000) | 0x0000_3000_0030_0000;
+        let v2 = (w2 & 0x00FF_FF00_0000_0000) | 0x3000_0030_3030_3030;
+        if !(all_digits(v0) & all_digits(v1) & all_digits(v2)) {
+            return None;
+        }
+        let x0 = v0 - 0x3030_3030_3030_3030;
+        let x1 = v1 - 0x3030_3030_3030_3030;
+        let x2 = v2 - 0x3030_3030_3030_3030;
+        let t0 = x0 * 10 + (x0 >> 8);
+        let t1 = x1 * 10 + (x1 >> 8);
+        let y = ((t0 & 0xFF) * 100 + ((t0 >> 16) & 0xFF)) as i64;
+        let mo = ((t0 >> 40) & 0xFF) as i64;
+        let d = (t1 & 0xFF) as i64;
+        let h = ((t1 >> 24) & 0xFF) as i64;
+        let mi = ((t1 >> 48) & 0xFF) as i64;
+        let s = (((x2 >> 40) & 0xFF) * 10 + ((x2 >> 48) & 0xFF)) as i64;
+        (y, mo, d, h, mi, s)
+    };
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
         return None;
     }
@@ -136,8 +178,9 @@ mod tests {
     #[test]
     fn matches_reference_parser() {
         let mut n = 0usize;
-        for d in ["../data/dev/events", "../data/dev/clicks"] {
-            for e in std::fs::read_dir(d).unwrap().flatten() {
+        let dev = crate::test_dir("SS_TEST_DEV", "../data/dev");
+        for d in ["events", "clicks"] {
+            for e in std::fs::read_dir(dev.join(d)).unwrap().flatten() {
                 let b = std::fs::read(e.path()).unwrap();
                 crate::scan::for_records::<7>(&b, |f| {
                     same(f[2]);

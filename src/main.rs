@@ -1520,6 +1520,12 @@ fn main() {
     std::process::exit(0);
 }
 
+/// Test data folders: the dev set and the kit fixtures, overridable for CI.
+#[cfg(test)]
+pub fn test_dir(var: &str, default: &str) -> PathBuf {
+    PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,16 +1550,17 @@ mod tests {
     }
     #[test]
     fn fast_splitter_matches_reference() {
-        let mut n = check_dir(Path::new("../kit/starter-duckdb/starter-duckdb/fixtures"));
-        n += check_dir(Path::new("../data/dev"));
+        let mut n = check_dir(&test_dir("SS_TEST_FIXTURES", "../kit/starter-duckdb/starter-duckdb/fixtures"));
+        n += check_dir(&test_dir("SS_TEST_DEV", "../data/dev"));
         for odd in [&b""[..], b",", b",,", b"\"", b"\"\"", b"\"a\"", b"a\"b", b"\"a", b"a\"", b"\"\"\"", b"x,\"y\",z,w", b"\"a\",\"b\"\r", b"a,b,c,d,e,f,g,h"] {
             assert_eq!(fields::<2>(odd), fields_fast::<2>(odd));
             assert_eq!(fields::<4>(odd), fields_fast::<4>(odd));
             assert_eq!(fields::<7>(odd), fields_fast::<7>(odd));
         }
         assert!(n > 1_000_000, "checked {n} lines");
-        for d in ["../data/dev/events", "../data/dev/clicks", "../data/dev/links"] {
-            for e in std::fs::read_dir(d).unwrap().flatten() {
+        let dev = test_dir("SS_TEST_DEV", "../data/dev");
+        for d in ["events", "clicks", "links"] {
+            for e in std::fs::read_dir(dev.join(d)).unwrap().flatten() {
                 let b = std::fs::read(e.path()).unwrap();
                 let mut want7 = vec![]; let mut want4 = vec![]; let mut want2 = vec![];
                 for_lines(&b, |l| { if let Some(x) = fields_fast::<7>(l) { want7.push(x) } if let Some(x) = fields_fast::<4>(l) { want4.push(x) } if let Some(x) = fields_fast::<2>(l) { want2.push(x) } });
