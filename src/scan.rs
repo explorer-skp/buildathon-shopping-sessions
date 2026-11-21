@@ -96,6 +96,87 @@ fn block(buf: &[u8], blk: usize) -> (u64, u64, u64) {
     }
 }
 
+const POS: u32 = 0x3FFF_FFFF;
+const ANOM: u32 = 1 << 30;
+const NL: u32 = 1 << 31;
+
+thread_local! {
+    static IDX: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes every complete line out of the index (generic, so f inlines here).
+#[inline(always)]
+fn take<'a, const N: usize, F: FnMut([&'a [u8]; N])>(
+    idx: &mut Vec<u32>,
+    ls: &mut usize,
+    skipping: &mut bool,
+    base: *const u8,
+    out: &mut [&'a [u8]; N],
+    f: &mut F,
+) {
+    let w = idx.len();
+    let mut j = 0usize;
+    loop {
+        if *skipping {
+            match idx[j..w].iter().position(|&e| e & NL != 0) {
+                Some(t) => {
+                    *ls = (idx[j + t] & POS) as usize + 1;
+                    j += t + 1;
+                    *skipping = false;
+                }
+                None => {
+                    j = w;
+                    break;
+                }
+            }
+            continue;
+        }
+        if j + N > w {
+            // a short line can still end within the entries left
+            match idx[j..w].iter().position(|&e| e & NL != 0) {
+                Some(t) => {
+                    *ls = (idx[j + t] & POS) as usize + 1;
+                    j += t + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let mut nlb = 0u32;
+        let mut an = 0u32;
+        for k in 0..N {
+            let e = idx[j + k];
+            nlb |= (e >> 31) << k;
+            an |= e & ANOM;
+        }
+        if nlb == 1 << (N - 1) {
+            let mut fs = *ls;
+            for k in 0..N {
+                let pos = (idx[j + k] & POS) as usize;
+                // fs <= pos: a field that starts with a quote is wrapped in one pair
+                let wq = (unsafe { *base.add(fs) } == b'"') as usize;
+                out[k] = unsafe { std::slice::from_raw_parts(base.add(fs + wq), (pos - fs).saturating_sub(2 * wq)) };
+                fs = pos + 1;
+            }
+            if an == 0 {
+                f(*out);
+            }
+            *ls = fs;
+            j += N;
+        } else if nlb != 0 {
+            // too few fields
+            let t = nlb.trailing_zeros() as usize;
+            *ls = (idx[j + t] & POS) as usize + 1;
+            j += t + 1;
+        } else {
+            // more than N fields
+            *skipping = true;
+            j += N;
+        }
+    }
+    idx.drain(..j);
+}
+
 /// Calls f with the fields of every well-formed line of a chunk.
 ///
 /// Quotes are checked a block at a time: with the running quote parity, an
@@ -104,91 +185,121 @@ fn block(buf: &[u8], blk: usize) -> (u64, u64, u64) {
 /// quotes. Exactly the lines breaking one of these have a field with quotes
 /// other than one pair around all of it, so those lines are dropped and every
 /// field of the others is stripped of its pair when it starts with a quote.
+///
+/// Each 64-byte block appends its delimiter positions to an index with a
+/// fixed, unrolled write; each entry is flagged as a newline and as ending a
+/// field that broke a quote rule. Lines are then taken N entries at a time.
 #[inline(always)]
 pub fn for_records<'a, const N: usize>(buf: &'a [u8], mut f: impl FnMut([&'a [u8]; N])) {
     let len = buf.len();
     if len == 0 {
         return;
     }
-    let base = buf.as_ptr();
-    let mut out: [&'a [u8]; N] = [&[]; N];
-    let mut k = 0usize; // fields closed in the current line
-    let mut bad = false; // the current line breaks a quote rule
-    let mut fs = 0usize; // current field start
-    let mut ls = 0usize; // current line start
-    let mut pdelim = 1u64; // the byte before this block ends a field (or there is none)
-    let mut carry = 0u64; // quote parity carried in: 0 or all ones
-    let mut cur = block(buf, 0);
-    let mut blk = 0usize;
-    while blk < len {
-        let (c, q, nl) = cur;
-        let nblk = blk + 64;
-        let next = if nblk < len { block(buf, nblk) } else { (0, 0, 0) };
-        let d = c | nl;
-        // a byte is followed by a delimiter, or by the end of the buffer
-        let after = if nblk < len {
-            ((next.0 | next.2) & 1) << 63
-        } else if nblk == len {
-            1u64 << 63
-        } else {
-            1u64 << (len - blk - 1)
-        };
-        let next_d = (d >> 1) | after;
-        let prev_d = (d << 1) | pdelim;
-        let mut px = prefix_xor(q) ^ carry;
-        if nl & px != 0 {
-            // a line ended inside quotes: restart the parity after its newline
-            let mut m = nl;
-            while m != 0 {
-                let j = m.trailing_zeros();
-                m &= m - 1;
-                if (px >> j) & 1 != 0 && j < 63 {
-                    px ^= !0u64 << (j + 1);
+    assert!(len < (1 << 30), "chunk too large for the delimiter index");
+    IDX.with(|cell| {
+        let mut idx = cell.borrow_mut();
+        idx.clear();
+        let base = buf.as_ptr();
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        let mut ls = 0usize; // start of the first line not yet taken
+        let mut skipping = false; // that line has more than N fields; drop it at its newline
+        let mut pdelim = 1u64; // the byte before this block ends a field (or there is none)
+        let mut carry = 0u64; // quote parity carried in: 0 or all ones
+        let mut pend = 0u32; // a quote rule broke after the last delimiter so far
+        let mut cur = block(buf, 0);
+        let mut blk = 0usize;
+        while blk < len {
+            let (c, q, nl) = cur;
+            let nblk = blk + 64;
+            let next = if nblk < len { block(buf, nblk) } else { (0, 0, 0) };
+            let d = c | nl;
+            // a byte is followed by a delimiter, or by the end of the buffer
+            let after = if nblk < len {
+                ((next.0 | next.2) & 1) << 63
+            } else if nblk == len {
+                1u64 << 63
+            } else {
+                1u64 << (len - blk - 1)
+            };
+            let next_d = (d >> 1) | after;
+            let prev_d = (d << 1) | pdelim;
+            let mut px = prefix_xor(q) ^ carry;
+            if nl & px != 0 {
+                // a line ended inside quotes: restart the parity after its newline
+                let mut m = nl;
+                while m != 0 {
+                    let j = m.trailing_zeros();
+                    m &= m - 1;
+                    if (px >> j) & 1 != 0 && j < 63 {
+                        px ^= !0u64 << (j + 1);
+                    }
                 }
             }
-        }
-        let mut amask = (d & px) | (q & px & !prev_d) | (q & !px & !next_d);
-        carry = if (px >> 63) & 1 != 0 && (nl >> 63) & 1 == 0 { !0 } else { 0 };
-        pdelim = d >> 63;
-        let mut dd = d;
-        while dd != 0 {
-            let i = dd.trailing_zeros();
-            dd &= dd - 1;
-            let pos = blk + i as usize;
-            if amask != 0 {
-                let lm = u64::MAX >> (63 - i);
-                bad |= amask & lm != 0;
-                amask &= !lm;
+            let mut amask = (d & px) | (q & px & !prev_d) | (q & !px & !next_d);
+            carry = if (px >> 63) & 1 != 0 && (nl >> 63) & 1 == 0 { !0 } else { 0 };
+            pdelim = d >> 63;
+            let cnt = d.count_ones() as usize;
+            let w = idx.len();
+            idx.reserve(cnt + 8);
+            let dst = unsafe { idx.as_mut_ptr().add(w) };
+            let mut dd = d;
+            // entries past cnt are scratch: they must not change amask
+            let put = |k: usize, dd: &mut u64, amask: &mut u64| {
+                let valid = (*dd != 0) as u64;
+                let i = dd.trailing_zeros() & 63;
+                *dd &= dd.wrapping_sub(1);
+                let lm = (u64::MAX >> (63 - i)) & valid.wrapping_neg();
+                let a = (*amask & lm != 0) as u32;
+                *amask &= !lm;
+                let e = (blk as u32 + i) | ((nl >> i) as u32 & 1) << 31 | a << 30;
+                unsafe { dst.add(k).write(e) };
+            };
+            if cnt <= 8 {
+                // fixed work per block
+                for k in 0..8 {
+                    put(k, &mut dd, &mut amask);
+                }
+            } else {
+                for k in 0..cnt {
+                    put(k, &mut dd, &mut amask);
+                }
             }
-            // fs <= pos < len: a field that starts with a quote is wrapped in one pair
-            let w = (unsafe { *base.add(fs) } == b'"') as usize;
-            out[k.min(N - 1)] =
-                unsafe { std::slice::from_raw_parts(base.add(fs + w), (pos - fs).saturating_sub(2 * w)) };
-            k += 1;
-            fs = pos + 1;
-            if (nl >> i) & 1 != 0 {
-                if !bad & (k == N) {
+            if cnt > 0 {
+                // a rule broken after the previous delimiter belongs to this block's first field end
+                unsafe { *dst |= pend << 30 };
+                pend = (amask != 0) as u32;
+            } else {
+                pend |= (amask != 0) as u32;
+            }
+            unsafe { idx.set_len(w + cnt) };
+            if idx.len() >= 4096 {
+                take::<N, _>(&mut idx, &mut ls, &mut skipping, base, &mut out, &mut f);
+            }
+            cur = next;
+            blk = nblk;
+        }
+        take::<N, _>(&mut idx, &mut ls, &mut skipping, base, &mut out, &mut f);
+        if ls < len && !skipping {
+            // a last line with no newline: its quotes must be closed at the end
+            let k = idx.len();
+            if k + 1 == N {
+                let bad = carry != 0 || pend != 0 || idx.iter().any(|&e| e & ANOM != 0);
+                if !bad {
+                    let mut fs = ls;
+                    for (kk, &e) in idx.iter().enumerate() {
+                        let pos = (e & POS) as usize;
+                        let wq = (buf[fs] == b'"') as usize;
+                        out[kk] = &buf[fs + wq..pos - wq];
+                        fs = pos + 1;
+                    }
+                    let fld = &buf[fs..];
+                    let wq = (fld.first() == Some(&b'"')) as usize;
+                    out[k] = &fld[wq..fld.len() - wq];
                     f(out);
                 }
-                k = 0;
-                bad = false;
-                ls = fs;
             }
         }
-        bad |= amask != 0;
-        cur = next;
-        blk = nblk;
-    }
-    if ls < len {
-        // a last line with no newline: its quotes must be closed at the end
-        bad |= carry != 0;
-        if !bad && k + 1 == N {
-            let fld = &buf[fs..];
-            let w = (fld.first() == Some(&b'"')) as usize;
-            out[k] = &fld[w..fld.len() - w];
-            f(out);
-        }
-    }
+    });
 }
 
 #[cfg(test)]
