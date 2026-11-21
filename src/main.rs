@@ -33,7 +33,7 @@ const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 
 macro_rules! log {
-    ($($t:tt)*) => { if std::env::var_os("SS_QUIET").is_none() { eprintln!($($t)*); } }
+    ($($t:tt)*) => { if std::env::var_os("SS_QUIET").is_none() || std::env::var_os("SS_LOG").is_some() { eprintln!($($t)*); } }
 }
 
 // ------------------------------------------------------------------ CSV

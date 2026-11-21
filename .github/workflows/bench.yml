@@ -1,0 +1,35 @@
+name: bench
+on: [workflow_dispatch, push]
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        run: |
+          nproc; free -g | head -2; lscpu | grep -E "Model name|Flags" | cut -c1-200
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+      - name: Build image
+        run: docker build --platform linux/amd64 -t entry .
+      - name: Make a 20M-event dataset
+        run: |
+          curl -fsSLO https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/generator.zip
+          unzip -q generator.zip
+          G=$(dirname $(find . -name Cargo.toml -path '*generator*' | head -1))
+          (cd $G && cargo build --release -q)
+          $G/target/release/generate --seed 7 --events 20000000 --clicks 5000000 --output data
+          du -sh data
+      - name: Time runs
+        run: |
+          mkdir -p scratch && chmod 777 scratch
+          run() {
+            rm -rf out && mkdir out && chmod 777 out
+            s=$(date +%s.%N)
+            docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
+              -e NCPU=$(nproc) -e MEM_GB=12 $1 -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch entry
+            e=$(date +%s.%N)
+            echo "$2: $(echo "$e - $s" | bc) s"
+          }
+          for i in 1 2 3; do run "" "plain"; run "-e GLIBC_TUNABLES=glibc.malloc.hugetlb=1" "thp-malloc"; done
+          rm -rf out && mkdir out && chmod 777 out
+          docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
