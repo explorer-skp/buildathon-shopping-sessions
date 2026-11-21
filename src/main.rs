@@ -593,6 +593,39 @@ fn keyed_sort<T: Copy>(g: &mut [T], key: impl Fn(&T) -> u128, keys: &mut Vec<u12
     g.copy_from_slice(tmp);
 }
 
+/// Sorts a group of person rows by (person, time) with u64 keys: each of the
+/// group's few people gets a rank, and rank << 52 | ts << 20 | row index sorts
+/// in the same order. Groups with over 64 people or 2^20 rows use u128 keys.
+fn sort_evp(g: &mut [EvP], keys: &mut Vec<u64>, wide: &mut Vec<u128>, tmp: &mut Vec<EvP>) {
+    let mut pks = [0u64; 64];
+    let mut np = 0usize;
+    let mut fits = g.len() < (1 << 20);
+    for e in g.iter() {
+        if !pks[..np].contains(&e.pk) {
+            if np == 64 {
+                fits = false;
+                break;
+            }
+            pks[np] = e.pk;
+            np += 1;
+        }
+    }
+    if !fits {
+        keyed_sort(g, |e| ((e.pk as u128) << 32) | e.ts as u128, wide, tmp);
+        return;
+    }
+    pks[..np].sort_unstable();
+    keys.clear();
+    keys.extend(g.iter().enumerate().map(|(i, e)| {
+        let r = if np == 1 { 0 } else { pks[..np].partition_point(|&p| p < e.pk) as u64 };
+        (r << 52) | ((e.ts as u64) << 20) | i as u64
+    }));
+    keys.sort_unstable();
+    tmp.clear();
+    tmp.extend(keys.iter().map(|&k| g[(k & 0xF_FFFF) as usize]));
+    g.copy_from_slice(tmp);
+}
+
 /// Gathers the slices into `out` in the order of `less`, which must order by
 /// the person key first. A counting pass on the `sb` key bits right below the
 /// partition bits splits the rows into small groups, then each group gets an
@@ -1200,7 +1233,8 @@ fn main() {
             let mut cls: Vec<ClP> = Vec::new();
             let mut byc: Vec<(u32, i64)> = Vec::new();
             let mut cnt: Vec<u32> = vec![0; (1 << sb) + 1];
-            let (mut skeys, mut skeys2) = (Vec::new(), Vec::new());
+            let (mut skeys, mut skeys3): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+            let (mut skeys2, mut skeys4): (Vec<u128>, Vec<u128>) = (Vec::new(), Vec::new());
             let (mut stmp, mut stmp2): (Vec<EvP>, Vec<EvP>) = (Vec::new(), Vec::new());
             for p in t * per_t..((t + 1) * per_t).min(NP) {
                 if old_sort {
@@ -1225,8 +1259,8 @@ fn main() {
                         sb,
                         |e: &EvP| e.pk,
                         |a: &EvP, b: &EvP| (a.pk, a.ts) < (b.pk, b.ts),
-                        |g: &mut [EvP]| keyed_sort(g, |e| e.ts as u128, &mut skeys, &mut stmp),
-                        |g: &mut [EvP]| keyed_sort(g, |e| ((e.pk as u128) << 32) | e.ts as u128, &mut skeys2, &mut stmp2),
+                        |g: &mut [EvP]| sort_evp(g, &mut skeys, &mut skeys2, &mut stmp),
+                        |g: &mut [EvP]| sort_evp(g, &mut skeys3, &mut skeys4, &mut stmp2),
                         &mut cnt,
                         &mut evs,
                     );
