@@ -1162,10 +1162,10 @@ fn main() {
     let dd_ref = &dd;
     let cl_ref = &cl_parts;
     let old_sort = std::env::var_os("SS_OLDSORT").is_some();
-    // group bits below the partition bits: about 2 events per group, so few
-    // groups hold more than one person
+    // group bits below the partition bits: about 8 events per group (finer
+    // groups measured no faster on x86)
     let n_kept: usize = dd.iter().map(|g| g.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let gdiv: usize = std::env::var("SS_GDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let gdiv: usize = std::env::var("SS_GDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let sb = ((n_kept / NP / gdiv).max(1).ilog2()).clamp(4, 18);
     let cat_rank = &cat_rank;
     let ud = out.join("user_daily");
