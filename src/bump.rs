@@ -101,6 +101,26 @@ pub fn init() {
     }
 }
 
+/// The used part of each region, split into pieces of at most `piece` bytes,
+/// for releasing the memory from several threads before exit.
+pub fn used_pieces(piece: usize) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for g in REGS.iter() {
+        let b = g.base.load(Ordering::Relaxed);
+        if b == 0 {
+            continue;
+        }
+        let e = g.next.load(Ordering::Relaxed).min(g.end.load(Ordering::Relaxed));
+        let mut p = b;
+        while p < e {
+            let n = piece.min(e - p);
+            v.push((p, n));
+            p += n;
+        }
+    }
+    v
+}
+
 /// Sends later allocations to the system allocator, which reuses freed
 /// memory. Blocks already handed out stay valid.
 pub fn stop() {

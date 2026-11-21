@@ -40,21 +40,21 @@ jobs:
           }
           for i in 1 2 3 4; do run prev "A(prev)"; run entry "B"; done
           # parse-phase cost split: each mode once with phase logs
-          for m in 0 1 2 3 4 0; do
+          for m in 0; do
             sudo rm -rf out && mkdir out && chmod 777 out
             docker run --rm --network none --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -e SS_PMODE=$m -v $PWD/data:/data:ro -v $PWD/out:/output entry 2>&1 | grep -E "parsed events and clicks" | sed "s/^/pmode $m: /"
           done
           # optional switch A/B on the new image, set in bench_ab.txt as: label env-args
           if [ -f bench_ab.txt ] && [ "$(cat bench_ab.txt)" != none ]; then read -r LAB ARGS < bench_ab.txt; for i in 1 2 3; do run entry "C($LAB)" $ARGS; run entry "B2"; done; fi
           for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
-          for i in 1 2 3; do
+          for kv in "" "-e SS_KEEPMEM=1" "" "-e SS_KEEPMEM=1" "" "-e SS_KEEPMEM=1"; do
             sudo rm -rf out && mkdir out && chmod 777 out
             s=$(date +%s%N)
-            docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m -e NCPU=$(nproc) -e MEM_GB=12 -e SS_STAMP=1 \
+            docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m -e NCPU=$(nproc) -e MEM_GB=12 -e SS_STAMP=1 $kv \
               -v $PWD/data:/data:ro -v $PWD/out:/output -v $PWD/scratch:/scratch entry 2> stamps.txt
             e=$(date +%s%N)
             a=$(grep "stamp start" stamps.txt | cut -d' ' -f3); b=$(grep "stamp end" stamps.txt | cut -d' ' -f3)
-            echo "split: before main $(( (a - s) / 1000000 )) ms, main $(( (b - a) / 1000000 )) ms, after exit $(( (e - b) / 1000000 )) ms"
+            echo "split [$kv]: before main $(( (a - s) / 1000000 )) ms, main $(( (b - a) / 1000000 )) ms, after exit $(( (e - b) / 1000000 )) ms"
           done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12

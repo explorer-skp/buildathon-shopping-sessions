@@ -1648,6 +1648,15 @@ fn main() {
             libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
         });
         log!("released inputs {:?}", t0.elapsed());
+        // Same for our own memory: exit would free gigabytes of huge pages on
+        // one thread. Everything is written by now.
+        if std::env::var_os("SS_KEEPMEM").is_none() {
+            let pieces = bump::used_pieces(64 << 20);
+            pieces.par_iter().for_each(|&(p, n)| unsafe {
+                libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED);
+            });
+            log!("released memory {:?}", t0.elapsed());
+        }
     }
     // skip destructors of large structures
     stamp("end");
