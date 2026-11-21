@@ -21,7 +21,7 @@ jobs:
           cat > run_in_docker.sh <<'X'
           #!/bin/sh
           D=$(cd "$1" && pwd); O=$(cd "$2" && pwd)
-          docker run --rm --network none --user 1000:1000 --read-only --tmpfs /tmp:rw,size=64m \
+          docker run --rm --network none --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,size=64m \
             -e DATA_DIR=/data -e OUTPUT_DIR=/output -e SCRATCH_DIR=/scratch -e HOME=/scratch -e NCPU=2 -e MEM_GB=6 \
             -v "$D":/data:ro -v "$O":/output -v /tmp/scratch:/scratch entry
           X
