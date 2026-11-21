@@ -990,13 +990,21 @@ fn main() {
             let hi_b = ((g + 1) * per_g).min(nb);
             let n_est: usize = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).sum();
             let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
-            // Open-addressing table per bucket, 8 bytes a slot: fingerprint << 32 |
-            // (index + 1), where the index counts the bucket's copies in file order.
-            // The copy kept for an event_id has the smallest ingest_ts, the earliest on ties.
-            let mut table: Vec<u64> = Vec::new();
+            // Open-addressing table, 8 bytes a slot: fingerprint << 32 | stamp, where
+            // stamp = stamp0 + index + 1 and the index counts the bucket's copies in
+            // file order. Stamps at or below stamp0 are left from earlier buckets and
+            // count as empty, so the table is never cleared. The copy kept for an
+            // event_id has the smallest ingest_ts (copies with equal ones are identical).
+            let max_n = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).max().unwrap_or(0);
+            let cap = (max_n * 3 / 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let mut table: Vec<u64> = vec![0; cap];
             let mut start: Vec<u32> = Vec::with_capacity(parsed_ref.len() + 1);
             let mut base: Vec<*const Ev> = Vec::with_capacity(parsed_ref.len());
-            let mut kept: Vec<*const Ev> = Vec::new();
+            let mut win: Vec<u32> = Vec::new(); // copies that led their event_id when seen, in file order
+            let mut lost: Vec<u32> = Vec::new(); // leaders later beaten by a copy with a smaller ingest_ts
+            let mut keep: Vec<*const Ev> = Vec::new();
+            let mut stamp0 = 0u64;
             for bi in lo_b..hi_b {
                 start.clear();
                 base.clear();
@@ -1014,26 +1022,30 @@ fn main() {
                     let c = start.partition_point(|&s| s <= i) - 1;
                     unsafe { &*base[c].add((i - start[c]) as usize) }
                 };
-                let cap = (n as usize * 3 / 2).next_power_of_two().max(16);
-                let mask = cap - 1;
-                table.clear();
-                table.resize(cap, 0);
-                let mut i = 0u64;
+                win.clear();
+                lost.clear();
+                let mut i = 0u32;
                 for p in parsed_ref.iter() {
                     for e in p[bi].iter() {
                         let fp = e.eid[0] >> 32;
+                        let me = stamp0 + i as u64 + 1;
                         let mut s = (e.eid[0] as usize) & mask;
                         loop {
                             let v = table[s];
-                            if v == 0 {
-                                table[s] = (fp << 32) | (i + 1);
+                            let st = v & 0xFFFF_FFFF;
+                            if st <= stamp0 {
+                                table[s] = (fp << 32) | me;
+                                win.push(i);
                                 break;
                             }
                             if v >> 32 == fp {
-                                let c = at(v as u32 - 1);
+                                let wi = (st - stamp0 - 1) as u32;
+                                let c = at(wi);
                                 if c.eid == e.eid {
                                     if e.ingest < c.ingest {
-                                        table[s] = (fp << 32) | (i + 1);
+                                        table[s] = (fp << 32) | me;
+                                        lost.push(wi);
+                                        win.push(i);
                                     }
                                     break;
                                 }
@@ -1043,36 +1055,34 @@ fn main() {
                         i += 1;
                     }
                 }
-                // walk the copies again in file order and keep each winner
-                kept.clear();
-                let mut i = 0u64;
-                for p in parsed_ref.iter() {
-                    for e in p[bi].iter() {
-                        let fp = e.eid[0] >> 32;
-                        let mut s = (e.eid[0] as usize) & mask;
-                        loop {
-                            let v = table[s];
-                            if v >> 32 == fp {
-                                if v & 0xFFFF_FFFF == i + 1 {
-                                    if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
-                                        kept.push(e as *const Ev);
-                                    }
-                                    break;
-                                }
-                                if at(v as u32 - 1).eid == e.eid {
-                                    break;
-                                }
-                            }
-                            s = (s + 1) & mask;
+                stamp0 += n as u64;
+                if !lost.is_empty() {
+                    lost.sort_unstable();
+                    let mut li = 0usize;
+                    win.retain(|&w| {
+                        while li < lost.len() && lost[li] < w {
+                            li += 1;
                         }
-                        i += 1;
+                        !(li < lost.len() && lost[li] == w)
+                    });
+                }
+                // winners that pass validation and the late rule, in file order
+                keep.clear();
+                let mut c = 0usize;
+                for &w in win.iter() {
+                    while start[c + 1] <= w {
+                        c += 1;
+                    }
+                    let e = unsafe { &*base[c].add((w - start[c]) as usize) };
+                    if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
+                        keep.push(e as *const Ev);
                     }
                 }
-                for i in 0..kept.len() {
-                    if i + 16 < kept.len() {
-                        link.prefetch(unsafe { (*kept[i + 16]).uh });
+                for i in 0..keep.len() {
+                    if i + 16 < keep.len() {
+                        link.prefetch(unsafe { (*keep[i + 16]).uh });
                     }
-                    let e = unsafe { &*kept[i] };
+                    let e = unsafe { &*keep[i] };
                     let pk = link.get(e.uh).unwrap_or(e.uh);
                     parts[part_of(pk)].push(EvP { pk, nref: e.uref, ts: e.ts, price: e.price, cat: e.cat });
                 }
