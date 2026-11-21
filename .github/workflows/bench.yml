@@ -33,12 +33,13 @@ jobs:
             echo "$2: $(echo "$e - $s" | bc) s"
           }
           for i in 1 2 3; do run "-e SS_OLDSORT=1" "A"; run "" "B"; done
+          for i in 1 2 3; do s=$(date +%s.%N); docker run --rm --network none --user 1000:1000 --read-only entry /bin/true; e=$(date +%s.%N); echo "empty container: $(echo "$e - $s" | bc) s"; done
           sudo rm -rf out && mkdir out && chmod 777 out
           docker run --rm --user 1000:1000 -e NCPU=$(nproc) -e SS_LOG=1 -v $PWD/data:/data:ro -v $PWD/out:/output entry /usr/local/bin/sessions 2>&1 | tail -12
       - name: Exit cost (native run)
         run: |
-          cargo build --release -q 2>/dev/null || true
-          for i in 1 2; do sudo rm -rf outn && mkdir outn; s=$(date +%s.%N); env NCPU=$(nproc) SS_LOG=1 DATA_DIR=data OUTPUT_DIR=outn target/release/sessions 2>&1 | grep -E "^done"; e=$(date +%s.%N); echo "process wall $(echo "$e - $s" | bc) s"; done
+          RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release -q 2>/dev/null || true
+          for i in 1 2; do sudo rm -rf outn && mkdir outn; s=$(date +%s.%N); env NCPU=$(nproc) SS_LOG=1 DATA_DIR=data OUTPUT_DIR=outn target/release/sessions 2>&1 | grep -E "done"; e=$(date +%s.%N); echo "process wall $(echo "$e - $s" | bc) s"; done
       - name: Compare with a known-good build on x86
         run: |
           git worktree add -q ../ref 57fb1f3094ccb8235fe30e3abb35b37ce8e32e43

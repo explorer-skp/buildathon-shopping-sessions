@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
@@ -533,17 +534,25 @@ impl LinkTable {
 
 // ------------------------------------------------------------------ records
 
-/// One parsed (non-malformed) event copy, before dedup.
-#[derive(Clone, Copy, Default)]
-struct Ev {
-    eid: [u64; 2],
-    ingest: i64,
-    uh: u64,   // user_id hash (meaningful when ok)
-    uref: u64, // user_id bytes (meaningful when ok)
-    ts: u32,   // ms since window start (meaningful when ok)
+/// One parsed (non-malformed) event copy, kept in file order.
+#[derive(Clone, Copy)]
+struct Rec {
+    uh: u64,   // user_id hash (meaningful when keep)
+    uref: u64, // user_id bytes (meaningful when keep)
+    ts: u32,   // ms since window start
     price: u32,
     cat: u16,
-    ok: bool, // passes validation (before the late rule)
+    keep: bool, // valid and not late: the event counts if this copy is the one kept
+}
+
+/// The dedup key of one copy: 96 bits of the event_id hash, the copy's
+/// ingest time, and its index among its chunk's records.
+#[derive(Clone, Copy)]
+struct Key {
+    e0: u64,
+    ingest: i64,
+    e1: u32,
+    rix: u32,
 }
 
 /// A surviving event, routed to its person's partition.
@@ -752,8 +761,8 @@ fn link_table(ln_parsed: LinkPairs, ids: Vec<(u64, u64)>) -> LinkTable {
     link
 }
 
-/// Parses every event file into dedup buckets keyed by the event_id hash.
-/// Persons are resolved later, after dedup, once the link table exists.
+/// Parses every event file: records in file order per chunk, and their dedup
+/// keys in buckets by the event_id hash. Persons are resolved after dedup.
 fn parse_events(
     maps: &[Option<Mmap>],
     chunks: &[Chunk],
@@ -762,13 +771,14 @@ fn parse_events(
     prod: &StrMap<u16>,
     unknown_cat: u16,
     nb: usize,
-) -> Vec<Vec<Vec<Ev>>> {
+) -> Vec<(Vec<Rec>, Vec<Vec<Key>>)> {
     chunks
         .par_iter()
         .map(|c| {
             let b: &[u8] = maps[c.file].as_ref().unwrap();
             let buf = &b[c.start..c.end];
-            let mut buckets: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
+            let mut recs: Vec<Rec> = Vec::with_capacity(buf.len() / 70 + 16);
+            let mut buckets: Vec<Vec<Key>> = (0..nb).map(|_| Vec::with_capacity(buf.len() / 70 / nb + 8)).collect();
             scan::for_records::<7>(buf, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
@@ -811,11 +821,14 @@ fn parse_events(
                     }
                     _ => ok = false,
                 }
-                let (uh, uref) = if ok { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
-                let e = Ev { eid: [h as u64, (h >> 64) as u64], ingest, uh, uref, ts: tsv, price: pr, cat, ok };
-                buckets[(h >> 64) as usize & (nb - 1)].push(e);
+                // the late rule needs only this copy's own times
+                let keep = ok && ingest - (tsv as i64 + ws) <= DAY;
+                let (uh, uref) = if keep { (xxh3_64(uid), pack(uid)) } else { (0, 0) };
+                let rix = recs.len() as u32;
+                recs.push(Rec { uh, uref, ts: tsv, price: pr, cat, keep });
+                buckets[(h >> 64) as usize & (nb - 1)].push(Key { e0: h as u64, ingest, e1: (h >> 96) as u32, rix });
             });
-            buckets
+            (recs, buckets)
         })
         .collect()
 }
@@ -953,9 +966,93 @@ fn main() {
         || parse_clicks(&cl_maps, &cl_chunks, cbase, we, &camp),
     );
     log!("parsed events and clicks {:?}", t0.elapsed());
+    let (ev_recs, ev_keys): (Vec<Vec<Rec>>, Vec<Vec<Vec<Key>>>) = parsed.into_iter().unzip();
+
+    // ---------------- dedup on event_id: mark each copy that is not the kept one.
+    // It needs no person data, so it runs while the union-find may still be going.
+    let losers: Vec<Vec<AtomicU64>> =
+        ev_recs.iter().map(|r| (0..r.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect()).collect();
+    let groups = (ncpu * 8).clamp(1, nb);
+    let per_g = nb.div_ceil(groups);
+    {
+        let keys = &ev_keys;
+        let losers = &losers;
+        (0..groups).into_par_iter().for_each(|g| {
+            let lo_b = g * per_g;
+            let hi_b = ((g + 1) * per_g).min(nb);
+            let mark = |c: usize, rix: u32| {
+                losers[c][(rix / 64) as usize].fetch_or(1u64 << (rix % 64), Ordering::Relaxed);
+            };
+            // Open-addressing table, 8 bytes a slot: fingerprint << 32 | stamp, where
+            // stamp = stamp0 + index + 1 and the index counts the bucket's copies in
+            // file order. Stamps at or below stamp0 are left from earlier buckets and
+            // count as empty, so the table is never cleared. The kept copy has the
+            // smallest ingest_ts; copies with equal ones are identical, and the
+            // earliest in file order stays.
+            let max_n = (lo_b..hi_b).map(|bi| keys.iter().map(|p| p[bi].len()).sum::<usize>()).max().unwrap_or(0);
+            let cap = (max_n * 3 / 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let mut table: Vec<u64> = vec![0; cap];
+            let mut start: Vec<u32> = Vec::with_capacity(keys.len() + 1);
+            let mut base: Vec<*const Key> = Vec::with_capacity(keys.len());
+            let mut stamp0 = 0u64;
+            for bi in lo_b..hi_b {
+                start.clear();
+                base.clear();
+                let mut n = 0u32;
+                for p in keys.iter() {
+                    start.push(n);
+                    base.push(p[bi].as_ptr());
+                    n += p[bi].len() as u32;
+                }
+                start.push(n);
+                if n == 0 {
+                    continue;
+                }
+                let at = |i: u32| -> (&Key, usize) {
+                    let c = start.partition_point(|&s| s <= i) - 1;
+                    (unsafe { &*base[c].add((i - start[c]) as usize) }, c)
+                };
+                let mut i = 0u32;
+                for (c, p) in keys.iter().enumerate() {
+                    for k in p[bi].iter() {
+                        let fp = k.e0 >> 32;
+                        let me = stamp0 + i as u64 + 1;
+                        let mut s = (k.e0 as usize) & mask;
+                        loop {
+                            let v = table[s];
+                            let st = v & 0xFFFF_FFFF;
+                            if st <= stamp0 {
+                                table[s] = (fp << 32) | me;
+                                break;
+                            }
+                            if v >> 32 == fp {
+                                let (w, wc) = at((st - stamp0 - 1) as u32);
+                                if w.e0 == k.e0 && w.e1 == k.e1 {
+                                    if k.ingest < w.ingest {
+                                        table[s] = (fp << 32) | me;
+                                        mark(wc, w.rix);
+                                    } else {
+                                        mark(c, k.rix);
+                                    }
+                                    break;
+                                }
+                            }
+                            s = (s + 1) & mask;
+                        }
+                        i += 1;
+                    }
+                }
+                stamp0 += n as u64;
+            }
+        });
+    }
+    std::mem::forget(ev_keys);
+    log!("deduped {:?}", t0.elapsed());
+
     let link = link_thread.join().expect("link thread");
     let link = &link;
-    log!("linked {} ids, all parsed {:?}", link.n, t0.elapsed());
+    log!("linked {} ids {:?}", link.n, t0.elapsed());
 
     // ---------------- clicks: resolve persons, route to person partitions
     let cl_parts: Vec<Vec<Vec<ClP>>> = cl_raw
@@ -979,119 +1076,36 @@ fn main() {
     std::mem::forget(cl_raw);
     log!("routed clicks {:?}", t0.elapsed());
 
-    // ---------------- dedup events per bucket, resolve persons, route to person partitions
-    let groups = (ncpu * 8).clamp(1, nb);
-    let per_g = nb.div_ceil(groups);
-    let parsed_ref = &parsed;
-    let dd: Vec<Vec<Vec<EvP>>> = (0..groups)
+    // ---------------- kept events: resolve persons, route to person partitions
+    let rgroups = (ncpu * 8).clamp(1, ev_recs.len().max(1));
+    let per_r = ev_recs.len().div_ceil(rgroups).max(1);
+    let dd: Vec<Vec<Vec<EvP>>> = (0..rgroups)
         .into_par_iter()
         .map(|g| {
-            let lo_b = g * per_g;
-            let hi_b = ((g + 1) * per_g).min(nb);
-            let n_est: usize = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).sum();
+            let lo = (g * per_r).min(ev_recs.len());
+            let hi = ((g + 1) * per_r).min(ev_recs.len());
+            let n_est: usize = ev_recs[lo..hi].iter().map(|r| r.len()).sum();
             let mut parts: Vec<Vec<EvP>> = (0..NP).map(|_| Vec::with_capacity(n_est / NP + n_est / NP / 4 + 4)).collect();
-            // Open-addressing table, 8 bytes a slot: fingerprint << 32 | stamp, where
-            // stamp = stamp0 + index + 1 and the index counts the bucket's copies in
-            // file order. Stamps at or below stamp0 are left from earlier buckets and
-            // count as empty, so the table is never cleared. The copy kept for an
-            // event_id has the smallest ingest_ts (copies with equal ones are identical).
-            let max_n = (lo_b..hi_b).map(|bi| parsed_ref.iter().map(|p| p[bi].len()).sum::<usize>()).max().unwrap_or(0);
-            let cap = (max_n * 3 / 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            let mut table: Vec<u64> = vec![0; cap];
-            let mut start: Vec<u32> = Vec::with_capacity(parsed_ref.len() + 1);
-            let mut base: Vec<*const Ev> = Vec::with_capacity(parsed_ref.len());
-            let mut win: Vec<u32> = Vec::new(); // copies that led their event_id when seen, in file order
-            let mut lost: Vec<u32> = Vec::new(); // leaders later beaten by a copy with a smaller ingest_ts
-            let mut keep: Vec<*const Ev> = Vec::new();
-            let mut stamp0 = 0u64;
-            for bi in lo_b..hi_b {
-                start.clear();
-                base.clear();
-                let mut n = 0u32;
-                for p in parsed_ref.iter() {
-                    start.push(n);
-                    base.push(p[bi].as_ptr());
-                    n += p[bi].len() as u32;
-                }
-                start.push(n);
-                if n == 0 {
-                    continue;
-                }
-                let at = |i: u32| -> &Ev {
-                    let c = start.partition_point(|&s| s <= i) - 1;
-                    unsafe { &*base[c].add((i - start[c]) as usize) }
-                };
-                win.clear();
-                lost.clear();
-                let mut i = 0u32;
-                for p in parsed_ref.iter() {
-                    for e in p[bi].iter() {
-                        let fp = e.eid[0] >> 32;
-                        let me = stamp0 + i as u64 + 1;
-                        let mut s = (e.eid[0] as usize) & mask;
-                        loop {
-                            let v = table[s];
-                            let st = v & 0xFFFF_FFFF;
-                            if st <= stamp0 {
-                                table[s] = (fp << 32) | me;
-                                win.push(i);
-                                break;
-                            }
-                            if v >> 32 == fp {
-                                let wi = (st - stamp0 - 1) as u32;
-                                let c = at(wi);
-                                if c.eid == e.eid {
-                                    if e.ingest < c.ingest {
-                                        table[s] = (fp << 32) | me;
-                                        lost.push(wi);
-                                        win.push(i);
-                                    }
-                                    break;
-                                }
-                            }
-                            s = (s + 1) & mask;
-                        }
-                        i += 1;
+            for c in lo..hi {
+                let recs = &ev_recs[c];
+                let lw = &losers[c];
+                for i in 0..recs.len() {
+                    if i + 16 < recs.len() {
+                        link.prefetch(recs[i + 16].uh);
                     }
-                }
-                stamp0 += n as u64;
-                if !lost.is_empty() {
-                    lost.sort_unstable();
-                    let mut li = 0usize;
-                    win.retain(|&w| {
-                        while li < lost.len() && lost[li] < w {
-                            li += 1;
-                        }
-                        !(li < lost.len() && lost[li] == w)
-                    });
-                }
-                // winners that pass validation and the late rule, in file order
-                keep.clear();
-                let mut c = 0usize;
-                for &w in win.iter() {
-                    while start[c + 1] <= w {
-                        c += 1;
+                    let r = &recs[i];
+                    if !r.keep || (lw[i / 64].load(Ordering::Relaxed) >> (i % 64)) & 1 != 0 {
+                        continue;
                     }
-                    let e = unsafe { &*base[c].add((w - start[c]) as usize) };
-                    if e.ok && e.ingest - (e.ts as i64 + ws) <= DAY {
-                        keep.push(e as *const Ev);
-                    }
-                }
-                for i in 0..keep.len() {
-                    if i + 16 < keep.len() {
-                        link.prefetch(unsafe { (*keep[i + 16]).uh });
-                    }
-                    let e = unsafe { &*keep[i] };
-                    let pk = link.get(e.uh).unwrap_or(e.uh);
-                    parts[part_of(pk)].push(EvP { pk, nref: e.uref, ts: e.ts, price: e.price, cat: e.cat });
+                    let pk = link.get(r.uh).unwrap_or(r.uh);
+                    parts[part_of(pk)].push(EvP { pk, nref: r.uref, ts: r.ts, price: r.price, cat: r.cat });
                 }
             }
             parts
         })
         .collect();
-    std::mem::forget(parsed);
-    log!("deduped {:?}", t0.elapsed());
+    std::mem::forget(ev_recs);
+    log!("routed events {:?}", t0.elapsed());
 
     // ---------------- sessionize, attribute, aggregate (parallel by person partitions)
     let ndays = ((we - ws + DAY - 1) / DAY + 1) as usize;
